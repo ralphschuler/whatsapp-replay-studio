@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { incomingMessageTimes, synthesizeDingChannel } from "../src/audio";
+import { incomingMessageTimes, mixReplayAudioChunk, synthesizeDingChannel } from "../src/audio";
 import { compileTimeline } from "../src/timeline";
-import type { ChatMessage } from "../src/types";
+import type { ChatMessage, PcmAudioClip } from "../src/types";
 
 function message(id: number, sender: string): ChatMessage {
   return {
@@ -45,5 +45,25 @@ describe("incoming ding", () => {
     }
 
     expect(maxDifference).toBeLessThan(1e-6);
+  });
+
+  it("mixes attached audio at its timeline position", () => {
+    const samples = new Float32Array(new ArrayBuffer(4 * Float32Array.BYTES_PER_ELEMENT));
+    samples.set([0.1, 0.2, 0.3, 0.4]);
+    const clip: PcmAudioClip = {
+      duration: 0.5,
+      sampleRate: 8,
+      left: samples,
+      right: samples.slice() as Float32Array<ArrayBuffer>,
+      peaks: [],
+    };
+    const mixed = mixReplayAudioChunk(2, 0, [], [{ at: 1, clip }], 8);
+    expect([...mixed.left.slice(0, 8)]).toEqual(new Array(8).fill(0));
+    expect([...mixed.left.slice(8, 12)]).toEqual([
+      expect.closeTo(0.1, 6),
+      expect.closeTo(0.2, 6),
+      expect.closeTo(0.3, 6),
+      expect.closeTo(0.4, 6),
+    ]);
   });
 });

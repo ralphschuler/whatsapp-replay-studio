@@ -1,5 +1,5 @@
 import { AudioBufferSource, BufferTarget, CanvasSource, Mp4OutputFormat, Output } from "mediabunny";
-import { streamDingAudio } from "./audio";
+import { streamReplayAudio } from "./audio";
 import { AssetMediaStore, ChatCanvasRenderer } from "./renderer";
 import type { CompiledTimeline, ExportPreset, ImportedProject, RenderTheme } from "./types";
 
@@ -31,15 +31,17 @@ export async function exportReplayMp4(options: ExportOptions): Promise<Blob> {
   if (!("VideoEncoder" in window)) {
     throw new Error("Dieser Browser unterstützt keinen schnellen MP4-Export. Bitte Chrome, Edge oder Safari in einer aktuellen Version verwenden.");
   }
-  if (options.incomingSound && !("AudioEncoder" in window)) {
-    throw new Error("Dieser Browser kann den Eingangston nicht in MP4 encodieren. Bitte einen aktuellen Chrome-, Edge- oder Safari-Browser verwenden.");
-  }
   options.onProgress?.({ phase: "prepare", progress: 0, frame: 0, totalFrames: 0 });
   await options.mediaStore.preloadForMessages(
     options.timeline.events.map((event) => event.message),
     (done, total) => options.onProgress?.({ phase: "prepare", progress: total ? done / total : 1, frame: done, totalFrames: total }),
   );
   if (options.signal?.aborted) throw abortError();
+  const scheduledAudioAssets = options.mediaStore.getScheduledAudioAssets(options.timeline);
+  const needsAudioTrack = options.incomingSound || scheduledAudioAssets.length > 0;
+  if (needsAudioTrack && !("AudioEncoder" in window)) {
+    throw new Error("Dieser Browser kann den Replay-Ton nicht in MP4 encodieren. Bitte einen aktuellen Chrome-, Edge- oder Safari-Browser verwenden.");
+  }
 
   const canvas = document.createElement("canvas");
   canvas.width = options.preset.width;
@@ -55,8 +57,12 @@ export async function exportReplayMp4(options: ExportOptions): Promise<Blob> {
     latencyMode: "quality",
   });
   output.addVideoTrack(source);
-  const audioSource = options.incomingSound
-    ? new AudioBufferSource({ codec: "aac", bitrate: 128_000 })
+  const audioSource = needsAudioTrack
+    ? new AudioBufferSource({
+      codec: "aac",
+      bitrate: 128_000,
+      transform: { sampleRate: 48_000, numberOfChannels: 2 },
+    })
     : null;
   if (audioSource) output.addAudioTrack(audioSource);
   await output.start();
@@ -75,7 +81,15 @@ export async function exportReplayMp4(options: ExportOptions): Promise<Blob> {
     await options.mediaStore.beginExportSession(options.timeline, fps);
     exportSessionActive = true;
     audioPromise = audioSource
-      ? streamDingAudio(audioSource, options.timeline, options.theme.selfName, options.signal)
+      ? streamReplayAudio(
+        audioSource,
+        options.timeline,
+        options.theme.selfName,
+        scheduledAudioAssets,
+        (path) => options.mediaStore.loadAudioClip(path),
+        options.incomingSound,
+        options.signal,
+      )
       : Promise.resolve();
     for (let frame = 0; frame < totalFrames; frame += 1) {
       if (options.signal?.aborted) throw abortError();
@@ -96,7 +110,7 @@ export async function exportReplayMp4(options: ExportOptions): Promise<Blob> {
     await output.finalize();
   } catch (error) {
     closeVideo();
-    audioSource?.close();
+    try { audioSource?.close(); } catch { /* It may already be closed by the streaming task. */ }
     await Promise.allSettled([audioPromise, exportSessionActive ? options.mediaStore.endExportSession() : Promise.resolve()]);
     if (output.state !== "canceled" && output.state !== "finalized") await output.cancel().catch(() => undefined);
     throw error;

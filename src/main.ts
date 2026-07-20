@@ -4,13 +4,14 @@ import { exportReplayMp4, type ExportProgress } from "./exporter";
 import { importWhatsAppExport, reparseProject } from "./importer";
 import { parseChat } from "./parser";
 import { AssetMediaStore, ChatCanvasRenderer } from "./renderer";
-import { compileTimeline, DEFAULT_TIMELINE_SETTINGS, formatDuration } from "./timeline";
+import { compileTimeline, DEFAULT_TIMELINE_SETTINGS, formatDuration, MEDIA_PREVIEW_SECONDS } from "./timeline";
 import type {
   CompiledTimeline,
   DateOrder,
   ExportPreset,
   ImportedProject,
   RenderTheme,
+  TimelineEvent,
   TimelineSettings,
   TimingMode,
 } from "./types";
@@ -72,7 +73,9 @@ let exportController: AbortController | null = null;
 let downloadUrl = "";
 let preparingPreview = false;
 let previousPlaybackTime = 0;
-const dingPlayer = new DingPlayer();
+let playbackGeneration = 0;
+const playedAudioEvents = new Set<string>();
+const audioPlayer = new DingPlayer();
 
 function currentPreset(): ExportPreset {
   return PRESETS[presetSelect.value] ?? PRESETS["portrait-720"]!;
@@ -206,9 +209,26 @@ function redraw(): void {
 
 function stopPlayback(): void {
   playing = false;
+  playbackGeneration += 1;
   cancelAnimationFrame(animationFrame);
+  audioPlayer.stopAll();
   playButton.textContent = "▶";
   playButton.setAttribute("aria-label", "Vorschau abspielen");
+}
+
+async function playAttachedAudio(event: TimelineEvent, generation: number): Promise<void> {
+  const attachment = event.message.attachment;
+  const activeStore = mediaStore;
+  if (!activeStore || attachment?.status !== "found" || attachment.kind !== "audio") return;
+  await activeStore.load(attachment.archivePath);
+  if (!playing || generation !== playbackGeneration || mediaStore !== activeStore) return;
+  const clip = activeStore.getAudioClip(attachment.archivePath);
+  const offset = currentTime - event.at;
+  const eventKey = `${event.message.id}@${event.at}`;
+  if (clip && offset >= 0 && offset < clip.duration && !playedAudioEvents.has(eventKey)) {
+    playedAudioEvents.add(eventKey);
+    void audioPlayer.playClip(clip, offset);
+  }
 }
 
 function playbackFrame(now: number): void {
@@ -221,14 +241,18 @@ function playbackFrame(now: number): void {
   } else {
     animationFrame = requestAnimationFrame(playbackFrame);
   }
-  if (incomingSoundInput.checked && currentTime > before) {
-    const incoming = timeline.events.some((event) =>
-      event.at > Math.max(before, previousPlaybackTime) &&
-      event.at <= currentTime &&
-      Boolean(event.message.sender) &&
-      event.message.sender !== selfSelect.value,
+  if (playing && currentTime > before) {
+    const generation = playbackGeneration;
+    const crossedEvents = timeline.events.filter((event) =>
+      event.at > Math.max(before, previousPlaybackTime) && event.at <= currentTime,
     );
-    if (incoming) void dingPlayer.play();
+    const hasIncoming = crossedEvents.some((event) =>
+      Boolean(event.message.sender) && event.message.sender !== selfSelect.value,
+    );
+    if (incomingSoundInput.checked && hasIncoming) void audioPlayer.play();
+    for (const event of crossedEvents) {
+      if (event.message.attachment?.kind === "audio") void playAttachedAudio(event, generation);
+    }
   }
   previousPlaybackTime = currentTime;
   redraw();
@@ -242,12 +266,23 @@ function togglePlayback(): void {
   }
   if (currentTime >= timeline.duration) currentTime = 0;
   playing = true;
+  playbackGeneration += 1;
+  playedAudioEvents.clear();
+  const generation = playbackGeneration;
   previousPlaybackTime = currentTime;
   playbackStartTime = currentTime;
   playbackStartedAt = performance.now();
   playButton.textContent = "❚❚";
   playButton.setAttribute("aria-label", "Vorschau pausieren");
-  if (incomingSoundInput.checked) void dingPlayer.unlock();
+  void audioPlayer.unlock();
+  for (const event of timeline.events) {
+    if (
+      event.at > currentTime ||
+      currentTime - event.at >= MEDIA_PREVIEW_SECONDS ||
+      event.message.attachment?.kind !== "audio"
+    ) continue;
+    void playAttachedAudio(event, generation);
+  }
   animationFrame = requestAnimationFrame(playbackFrame);
 }
 
@@ -258,6 +293,7 @@ async function prepareMediaForPreview(): Promise<void> {
 }
 
 function populateProject(nextProject: ImportedProject, keepTitle = false): void {
+  stopPlayback();
   project = nextProject;
   setExportBusy(false);
   mediaStore?.dispose();

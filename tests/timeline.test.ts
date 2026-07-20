@@ -53,6 +53,32 @@ describe("timeline compiler", () => {
     expect(timeline.events[1]!.at - timeline.events[0]!.at).toBeGreaterThan(4);
   });
 
+  it("also holds audio and GIF messages long enough to play", () => {
+    const audio = message(0, 0);
+    audio.kind = "media";
+    audio.attachment = {
+      archivePath: "voice.opus",
+      displayName: "voice.opus",
+      kind: "audio",
+      mimeType: "audio/opus",
+      size: 100,
+      status: "found",
+    };
+    const gif = message(1, 1);
+    gif.kind = "media";
+    gif.attachment = {
+      archivePath: "reaction.gif",
+      displayName: "reaction.gif",
+      kind: "image",
+      mimeType: "image/gif",
+      size: 100,
+      status: "found",
+    };
+    const timeline = compileTimeline([audio, gif, message(2, 2)]);
+    expect(timeline.events[1]!.at - timeline.events[0]!.at).toBeGreaterThan(4);
+    expect(timeline.events[2]!.at - timeline.events[1]!.at).toBeGreaterThan(4);
+  });
+
   it("finds visible events with binary search", () => {
     const timeline = compileTimeline([message(0, 0), message(1, 1)]);
     expect(visibleEventCount(timeline, 0)).toBe(0);

@@ -90,6 +90,24 @@ export interface CompiledTimeline {
   duration: number;
 }
 
+export interface PcmAudioClip {
+  duration: number;
+  sampleRate: number;
+  left: Float32Array<ArrayBuffer>;
+  right: Float32Array<ArrayBuffer>;
+  peaks: number[];
+}
+
+export interface ScheduledAudioClip {
+  at: number;
+  clip: PcmAudioClip;
+}
+
+export interface ScheduledAudioAsset {
+  at: number;
+  path: string;
+}
+
 export interface RenderTheme {
   mode: "light" | "dark";
   title: string;

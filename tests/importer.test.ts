@@ -6,7 +6,7 @@ import { importWhatsAppExport } from "../src/importer";
 describe("ZIP importer", () => {
   it("associates localized iOS attachment tags with ZIP assets", async () => {
     const zip = new JSZip();
-    const filenames = ["photo.jpg", "clip.mov", "animation.mp4", "voice.opus"];
+    const filenames = ["photo.jpg", "clip.mov", "animation.mp4", "voice.opus", "reaction.gif"];
     zip.file("_chat.txt", filenames.map((filename, index) =>
       `[17.07.26, 09:57:${String(50 + index).padStart(2, "0")}] Ralph: \u200e<Anhang: ${filename}>`,
     ).join("\n"));
@@ -17,8 +17,8 @@ describe("ZIP importer", () => {
 
     const project = await importWhatsAppExport(file);
 
-    expect(project.assets).toHaveLength(4);
-    expect(project.attachmentStats).toMatchObject({ matched: 4, missing: 0, ambiguous: 0, unreferenced: 0 });
-    expect(project.chat.messages.map((message) => message.attachment?.kind)).toEqual(["image", "video", "video", "audio"]);
+    expect(project.assets).toHaveLength(5);
+    expect(project.attachmentStats).toMatchObject({ matched: 5, missing: 0, ambiguous: 0, unreferenced: 0 });
+    expect(project.chat.messages.map((message) => message.attachment?.kind)).toEqual(["image", "video", "video", "audio", "image"]);
   });
 });

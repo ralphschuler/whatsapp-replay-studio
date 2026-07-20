@@ -1,20 +1,24 @@
-import { ALL_FORMATS, BlobSource, Input, VideoSample, VideoSampleSink } from "mediabunny";
-import { VIDEO_PREVIEW_SECONDS, visibleEventCount } from "./timeline";
+import { ALL_FORMATS, AudioBufferSink, BlobSource, Input, VideoSample, VideoSampleSink } from "mediabunny";
+import { MEDIA_PREVIEW_SECONDS, visibleEventCount } from "./timeline";
 import type {
   ArchiveAsset,
   ChatMessage,
   CompiledTimeline,
   ImportedProject,
+  PcmAudioClip,
   RenderTheme,
+  ScheduledAudioAsset,
 } from "./types";
 
-type DrawableImage = ImageBitmap | HTMLImageElement;
+type DrawableImage = ImageBitmap | HTMLImageElement | HTMLCanvasElement;
 
 interface VideoDecoderEntry {
   input: Input<BlobSource>;
   sink: VideoSampleSink;
   firstTimestamp: number;
   duration: number;
+  width: number;
+  height: number;
   frame: VideoSample | null;
   frameTime: number;
   pending: Promise<void> | null;
@@ -24,14 +28,95 @@ interface VideoDecoderEntry {
   exportFallback: boolean;
 }
 
+interface AnimatedImageEntry {
+  decoder: ImageDecoder;
+  width: number;
+  height: number;
+  frameDurations: number[];
+  totalDuration: number;
+  frame: VideoFrame | null;
+  frameIndex: number;
+  pending: Promise<void> | null;
+}
+
 interface BubbleLayout {
   message: ChatMessage;
   lines: string[];
   senderLabel: string;
   width: number;
   height: number;
+  mediaWidth: number;
   mediaHeight: number;
   dateLabel?: string;
+}
+
+export function fitMediaBox(
+  sourceWidth: number,
+  sourceHeight: number,
+  maxWidth: number,
+  maxHeight: number,
+): { width: number; height: number } {
+  if (sourceWidth <= 0 || sourceHeight <= 0) return { width: maxWidth, height: Math.min(maxHeight, maxWidth * 9 / 16) };
+  const factor = Math.min(maxWidth / sourceWidth, maxHeight / sourceHeight);
+  return { width: sourceWidth * factor, height: sourceHeight * factor };
+}
+
+export function canvasScale(width: number, height: number): number {
+  return Math.max(0.1, Math.min(width / 1080, height / 1080));
+}
+
+export function animatedFrameIndex(frameDurations: number[], time: number, totalDuration: number): number {
+  if (!frameDurations.length || totalDuration <= 0) return 0;
+  const localTime = ((time % totalDuration) + totalDuration) % totalDuration;
+  let boundary = 0;
+  for (let index = 0; index < frameDurations.length; index += 1) {
+    boundary += frameDurations[index] ?? 0;
+    if (localTime < boundary - 1e-9) return index;
+  }
+  return frameDurations.length - 1;
+}
+
+const AUDIO_SAMPLE_RATE = 48_000;
+const MAX_CACHED_AUDIO_CLIPS = 24;
+
+function mixAudioBuffer(
+  left: Float32Array<ArrayBuffer>,
+  right: Float32Array<ArrayBuffer>,
+  buffer: AudioBuffer,
+  localStart: number,
+): void {
+  const sourceLeft = buffer.getChannelData(0);
+  const sourceRight = buffer.getChannelData(Math.min(1, buffer.numberOfChannels - 1));
+  // Half-open packet ranges ensure adjacent decoded buffers never write the
+  // same resampled output frame (important for 44.1 kHz AAC packet borders).
+  const firstOutput = Math.max(0, Math.ceil(localStart * AUDIO_SAMPLE_RATE));
+  const lastOutput = Math.min(left.length, Math.ceil((localStart + buffer.duration) * AUDIO_SAMPLE_RATE));
+  for (let outputIndex = firstOutput; outputIndex < lastOutput; outputIndex += 1) {
+    const sourcePosition = (outputIndex / AUDIO_SAMPLE_RATE - localStart) * buffer.sampleRate;
+    if (sourcePosition < 0) continue;
+    const sourceIndex = Math.floor(sourcePosition);
+    if (sourceIndex >= sourceLeft.length) break;
+    const fraction = sourcePosition - sourceIndex;
+    const nextIndex = Math.min(sourceLeft.length - 1, sourceIndex + 1);
+    const leftValue = (sourceLeft[sourceIndex] ?? 0) + ((sourceLeft[nextIndex] ?? 0) - (sourceLeft[sourceIndex] ?? 0)) * fraction;
+    const rightValue = (sourceRight[sourceIndex] ?? 0) + ((sourceRight[nextIndex] ?? 0) - (sourceRight[sourceIndex] ?? 0)) * fraction;
+    left[outputIndex] = (left[outputIndex] ?? 0) + leftValue;
+    right[outputIndex] = (right[outputIndex] ?? 0) + rightValue;
+  }
+}
+
+function waveformPeaks(left: Float32Array<ArrayBuffer>, right: Float32Array<ArrayBuffer>, count = 42): number[] {
+  const result: number[] = [];
+  const step = Math.max(1, Math.ceil(left.length / count));
+  for (let bar = 0; bar < count; bar += 1) {
+    let peak = 0;
+    const end = Math.min(left.length, (bar + 1) * step);
+    for (let index = bar * step; index < end; index += 1) {
+      peak = Math.max(peak, Math.abs(left[index] ?? 0), Math.abs(right[index] ?? 0));
+    }
+    result.push(Math.min(1, Math.max(0.08, peak)));
+  }
+  return result;
 }
 
 interface Palette {
@@ -144,8 +229,15 @@ function senderLabel(message: ChatMessage, theme: RenderTheme, participants: str
 export class AssetMediaStore {
   private readonly assets = new Map<string, ArchiveAsset>();
   private readonly images = new Map<string, DrawableImage>();
+  private readonly animatedImages = new Map<string, AnimatedImageEntry>();
   private readonly videos = new Map<string, VideoDecoderEntry>();
+  private readonly audios = new Map<string, PcmAudioClip>();
+  private readonly audioAccess = new Map<string, number>();
+  private audioAccessCounter = 0;
+  private readonly objectUrls = new Set<string>();
   private readonly failed = new Set<string>();
+  private readonly loading = new Map<string, Promise<void>>();
+  private disposed = false;
 
   constructor(project: ImportedProject) {
     for (const asset of project.assets) this.assets.set(asset.path, asset);
@@ -163,6 +255,48 @@ export class AssetMediaStore {
     return this.videos.get(path)?.duration;
   }
 
+  getAnimatedFrame(path: string): VideoFrame | undefined {
+    return this.animatedImages.get(path)?.frame ?? undefined;
+  }
+
+  isAnimatedImage(path: string): boolean {
+    return this.animatedImages.has(path);
+  }
+
+  getAudioClip(path: string): PcmAudioClip | undefined {
+    const clip = this.audios.get(path);
+    if (clip) this.audioAccess.set(path, ++this.audioAccessCounter);
+    return clip;
+  }
+
+  getMediaDimensions(path: string): { width: number; height: number } | undefined {
+    const video = this.videos.get(path);
+    if (video) return { width: video.width, height: video.height };
+    const animated = this.animatedImages.get(path);
+    if (animated) return { width: animated.width, height: animated.height };
+    const image = this.images.get(path);
+    if (!image) return undefined;
+    return {
+      width: "naturalWidth" in image ? image.naturalWidth : image.width,
+      height: "naturalHeight" in image ? image.naturalHeight : image.height,
+    };
+  }
+
+  getScheduledAudioAssets(timeline: CompiledTimeline): ScheduledAudioAsset[] {
+    const result: ScheduledAudioAsset[] = [];
+    for (const event of timeline.events) {
+      const attachment = event.message.attachment;
+      if (attachment?.status !== "found" || attachment.kind !== "audio") continue;
+      result.push({ at: event.at, path: attachment.archivePath });
+    }
+    return result;
+  }
+
+  async loadAudioClip(path: string): Promise<PcmAudioClip | undefined> {
+    await this.load(path);
+    return this.getAudioClip(path);
+  }
+
   async preloadForMessages(messages: ChatMessage[], onProgress?: (done: number, total: number) => void): Promise<void> {
     const paths = [...new Set(messages
       .filter((message) => message.attachment?.status === "found" && ["image", "sticker", "video"].includes(message.attachment.kind))
@@ -177,7 +311,24 @@ export class AssetMediaStore {
   }
 
   async load(path: string): Promise<void> {
-    if (this.images.has(path) || this.videos.has(path) || this.failed.has(path)) return;
+    if (this.disposed) return;
+    if (this.images.has(path) || this.animatedImages.has(path) || this.videos.has(path) || this.audios.has(path) || this.failed.has(path)) return;
+    const activeLoad = this.loading.get(path);
+    if (activeLoad) {
+      await activeLoad;
+      return;
+    }
+    const pending = this.loadAsset(path);
+    this.loading.set(path, pending);
+    try {
+      await pending;
+    } finally {
+      this.loading.delete(path);
+      if (this.disposed) this.releaseResources();
+    }
+  }
+
+  private async loadAsset(path: string): Promise<void> {
     const asset = this.assets.get(path);
     if (!asset || asset.size > 80 * 1024 * 1024 || /heic|heif/iu.test(asset.mimeType)) {
       this.failed.add(path);
@@ -188,23 +339,174 @@ export class AssetMediaStore {
         await this.loadVideo(asset);
         return;
       }
-      const blob = await asset.loadBlob();
-      if ("createImageBitmap" in window) {
-        const bitmap = await createImageBitmap(blob);
-        this.images.set(path, bitmap);
-      } else {
-        const url = URL.createObjectURL(blob);
-        const image = new Image();
-        await new Promise<void>((resolve, reject) => {
-          image.onload = () => resolve();
-          image.onerror = () => reject(new Error("Bild konnte nicht geladen werden"));
-          image.src = url;
-        });
-        URL.revokeObjectURL(url);
-        this.images.set(path, image);
+      if (asset.kind === "audio") {
+        await this.loadAudio(asset);
+        return;
       }
+      const blob = await asset.loadBlob();
+      if (asset.mimeType === "image/gif" || /\.gif$/iu.test(asset.basename)) {
+        try {
+          await this.loadAnimatedImage(asset, blob);
+          return;
+        } catch {
+          await this.loadStaticGifFallback(asset.path, blob);
+          return;
+        }
+      }
+      await this.loadStaticImage(asset.path, blob);
     } catch {
       this.failed.add(path);
+    }
+  }
+
+  private async loadStaticImage(path: string, blob: Blob): Promise<void> {
+    if (typeof createImageBitmap === "function") {
+      const bitmap = await createImageBitmap(blob, { imageOrientation: "from-image" });
+      this.images.set(path, bitmap);
+      return;
+    }
+    await this.loadHtmlImage(path, blob);
+  }
+
+  private async loadHtmlImage(path: string, blob: Blob): Promise<void> {
+    const url = URL.createObjectURL(blob);
+    const image = new Image();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        image.onload = () => resolve();
+        image.onerror = () => reject(new Error("Bild konnte nicht geladen werden"));
+        image.src = url;
+      });
+      this.objectUrls.add(url);
+      this.images.set(path, image);
+    } catch (error) {
+      URL.revokeObjectURL(url);
+      throw error;
+    }
+  }
+
+  private async loadStaticGifFallback(path: string, blob: Blob): Promise<void> {
+    if (typeof createImageBitmap === "function") {
+      try {
+        const bitmap = await createImageBitmap(blob);
+        this.images.set(path, bitmap);
+        return;
+      } catch {
+        // Some browsers expose createImageBitmap but cannot decode GIF files.
+        // Continue with the HTMLImage/canvas fallback below.
+      }
+    }
+    const url = URL.createObjectURL(blob);
+    const image = new Image();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        image.onload = () => resolve();
+        image.onerror = () => reject(new Error("GIF konnte nicht geladen werden"));
+        image.src = url;
+      });
+      const canvas = document.createElement("canvas");
+      canvas.width = image.naturalWidth;
+      canvas.height = image.naturalHeight;
+      const context = canvas.getContext("2d");
+      if (!context) throw new Error("GIF-Fallback konnte nicht gerendert werden");
+      context.drawImage(image, 0, 0);
+      this.images.set(path, canvas);
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  }
+
+  private async loadAnimatedImage(asset: ArchiveAsset, blob: Blob): Promise<void> {
+    if (typeof ImageDecoder === "undefined" || !await ImageDecoder.isTypeSupported("image/gif")) {
+      throw new Error("Animierte GIFs werden von diesem Browser nicht dekodiert");
+    }
+    const decoder = new ImageDecoder({
+      data: await blob.arrayBuffer(),
+      type: "image/gif",
+      preferAnimation: true,
+    });
+    try {
+      await decoder.tracks.ready;
+      const track = decoder.tracks.selectedTrack;
+      if (!track || track.frameCount < 1) throw new Error("GIF enthält keine Frames");
+      const frameDurations: number[] = [];
+      let totalDuration = 0;
+      let firstFrame: VideoFrame | null = null;
+      const frameLimit = Math.min(track.frameCount, 1_200);
+      for (let frameIndex = 0; frameIndex < frameLimit && totalDuration < MEDIA_PREVIEW_SECONDS; frameIndex += 1) {
+        try {
+          const result = await decoder.decode({ frameIndex, completeFramesOnly: true });
+          const duration = Math.max(0.02, (result.image.duration ?? 100_000) / 1_000_000);
+          frameDurations.push(duration);
+          totalDuration += duration;
+          if (!firstFrame) firstFrame = result.image;
+          else result.image.close();
+        } catch {
+          break;
+        }
+      }
+      if (!firstFrame || !frameDurations.length) throw new Error("GIF konnte nicht dekodiert werden");
+      this.animatedImages.set(asset.path, {
+        decoder,
+        width: firstFrame.displayWidth,
+        height: firstFrame.displayHeight,
+        frameDurations,
+        totalDuration,
+        frame: firstFrame,
+        frameIndex: 0,
+        pending: null,
+      });
+    } catch (error) {
+      decoder.close();
+      throw error;
+    }
+  }
+
+  private async loadAudio(asset: ArchiveAsset): Promise<void> {
+    let input: Input<BlobSource> | null = null;
+    try {
+      const blob = await asset.loadBlob();
+      input = new Input({ source: new BlobSource(blob), formats: ALL_FORMATS });
+      if (!await input.canRead()) throw new Error("Audioformat nicht lesbar");
+      const track = await input.getPrimaryAudioTrack();
+      if (!track) throw new Error("Keine Audiospur gefunden");
+      if (!await track.canDecode()) throw new Error("Audiocodec wird von diesem Browser nicht unterstützt");
+      const firstTimestamp = await track.getFirstTimestamp();
+      const endTimestamp = await track.getDurationFromMetadata() ?? await track.computeDuration();
+      const expectedDuration = Math.min(MEDIA_PREVIEW_SECONDS, Math.max(0.01, endTimestamp - firstTimestamp));
+      const capacity = Math.max(1, Math.ceil(expectedDuration * AUDIO_SAMPLE_RATE));
+      const left = new Float32Array(new ArrayBuffer(capacity * Float32Array.BYTES_PER_ELEMENT));
+      const right = new Float32Array(new ArrayBuffer(capacity * Float32Array.BYTES_PER_ELEMENT));
+      const sink = new AudioBufferSink(track);
+      let decodedEnd = 0;
+      for await (const wrapped of sink.buffers(firstTimestamp, firstTimestamp + expectedDuration)) {
+        const localStart = wrapped.timestamp - firstTimestamp;
+        mixAudioBuffer(left, right, wrapped.buffer, localStart);
+        decodedEnd = Math.max(decodedEnd, Math.min(expectedDuration, localStart + wrapped.duration));
+      }
+      if (decodedEnd <= 0) throw new Error("Audiodatei enthält keine dekodierbaren Samples");
+      const duration = Math.min(expectedDuration, decodedEnd);
+      const length = Math.max(1, Math.ceil(duration * AUDIO_SAMPLE_RATE));
+      const trimmedLeft = left.slice(0, length) as Float32Array<ArrayBuffer>;
+      const trimmedRight = right.slice(0, length) as Float32Array<ArrayBuffer>;
+      this.audios.set(asset.path, {
+        duration,
+        sampleRate: AUDIO_SAMPLE_RATE,
+        left: trimmedLeft,
+        right: trimmedRight,
+        peaks: waveformPeaks(trimmedLeft, trimmedRight),
+      });
+      this.audioAccess.set(asset.path, ++this.audioAccessCounter);
+      while (this.audios.size > MAX_CACHED_AUDIO_CLIPS) {
+        const oldest = [...this.audioAccess.entries()]
+          .filter(([path]) => path !== asset.path)
+          .sort((a, b) => a[1] - b[1])[0]?.[0];
+        if (!oldest) break;
+        this.audios.delete(oldest);
+        this.audioAccess.delete(oldest);
+      }
+    } finally {
+      input?.dispose();
     }
   }
 
@@ -219,11 +521,14 @@ export class AssetMediaStore {
       if (!await track.canDecode()) throw new Error("Videocodec wird von diesem Browser nicht unterstützt");
       const firstTimestamp = await track.getFirstTimestamp();
       const endTimestamp = await track.getDurationFromMetadata() ?? await track.computeDuration();
+      const [width, height] = await Promise.all([track.getDisplayWidth(), track.getDisplayHeight()]);
       const entry: VideoDecoderEntry = {
         input,
         sink: new VideoSampleSink(track),
         firstTimestamp,
         duration: Math.max(0.01, endTimestamp - firstTimestamp),
+        width,
+        height,
         frame: null,
         frameTime: -1,
         pending: null,
@@ -251,9 +556,22 @@ export class AssetMediaStore {
     if (exact && entry.exportIterator && !entry.exportFallback) {
       while (entry.exportCursor < entry.exportTimes.length && (entry.exportTimes[entry.exportCursor] ?? Infinity) <= target + 0.0005) {
         const scheduledTime = entry.exportTimes[entry.exportCursor] ?? target;
-        const result = await entry.exportIterator.next();
+        let result: IteratorResult<VideoSample | null, void>;
+        try {
+          result = await entry.exportIterator.next();
+        } catch {
+          this.failed.add(path);
+          entry.exportFallback = true;
+          try { await entry.exportIterator.return(); } catch { /* Keep the last decoded frame. */ }
+          entry.exportIterator = null;
+          return;
+        }
         entry.exportCursor += 1;
         if (!result.value) continue;
+        if (this.disposed) {
+          result.value.close();
+          return;
+        }
         entry.frame?.close();
         entry.frame = result.value;
         entry.frameTime = scheduledTime;
@@ -268,6 +586,10 @@ export class AssetMediaStore {
     entry.pending = entry.sink.getSample(entry.firstTimestamp + target)
       .then((sample) => {
         if (!sample) return;
+        if (this.disposed) {
+          sample.close();
+          return;
+        }
         entry.frame?.close();
         entry.frame = sample;
         entry.frameTime = target;
@@ -281,6 +603,34 @@ export class AssetMediaStore {
     await entry.pending;
   }
 
+  async prepareAnimatedFrame(path: string, time: number, exact = false): Promise<void> {
+    const entry = this.animatedImages.get(path);
+    if (!entry) return;
+    const target = exact ? time : Math.floor(time * 15) / 15;
+    const nextIndex = animatedFrameIndex(entry.frameDurations, target, entry.totalDuration);
+    if (entry.frameIndex === nextIndex && entry.frame) return;
+    if (entry.pending) {
+      await entry.pending;
+      if (exact && entry.frameIndex !== nextIndex) await this.prepareAnimatedFrame(path, target, true);
+      return;
+    }
+    entry.pending = entry.decoder.decode({ frameIndex: nextIndex, completeFramesOnly: true })
+      .then((result) => {
+        if (this.disposed) {
+          result.image.close();
+          return;
+        }
+        entry.frame?.close();
+        entry.frame = result.image;
+        entry.frameIndex = nextIndex;
+        entry.width = result.image.displayWidth;
+        entry.height = result.image.displayHeight;
+      })
+      .catch(() => undefined)
+      .finally(() => { entry.pending = null; });
+    await entry.pending;
+  }
+
   async beginExportSession(timeline: CompiledTimeline, fps: number): Promise<void> {
     await Promise.all([...this.videos.values()].map((entry) => entry.pending).filter((pending): pending is Promise<void> => Boolean(pending)));
     const byPath = new Map<string, { eventAt: number; duration: number }[]>();
@@ -290,7 +640,7 @@ export class AssetMediaStore {
       const entry = this.videos.get(attachment.archivePath);
       if (!entry) continue;
       const items = byPath.get(attachment.archivePath) ?? [];
-      items.push({ eventAt: event.at, duration: Math.min(VIDEO_PREVIEW_SECONDS, entry.duration) });
+      items.push({ eventAt: event.at, duration: Math.min(MEDIA_PREVIEW_SECONDS, entry.duration) });
       byPath.set(attachment.archivePath, items);
     }
     for (const [path, events] of byPath) {
@@ -326,7 +676,7 @@ export class AssetMediaStore {
     }
   }
 
-  dispose(): void {
+  private releaseResources(): void {
     for (const image of this.images.values()) {
       if ("close" in image && typeof image.close === "function") image.close();
     }
@@ -335,8 +685,22 @@ export class AssetMediaStore {
       video.frame?.close();
       video.input.dispose();
     }
+    for (const animated of this.animatedImages.values()) {
+      animated.frame?.close();
+      animated.decoder.close();
+    }
+    for (const url of this.objectUrls) URL.revokeObjectURL(url);
     this.images.clear();
+    this.animatedImages.clear();
     this.videos.clear();
+    this.audios.clear();
+    this.audioAccess.clear();
+    this.objectUrls.clear();
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    this.releaseResources();
   }
 }
 
@@ -365,7 +729,7 @@ export class ChatCanvasRenderer {
     this.currentTime = time;
     const ctx = this.ctx;
     const { width: w, height: h } = this.canvas;
-    const scale = w / 1080;
+    const scale = canvasScale(w, h);
     const palette = theme.mode === "dark" ? DARK : LIGHT;
     ctx.save();
     ctx.globalAlpha = 1;
@@ -393,12 +757,19 @@ export class ChatCanvasRenderer {
     const promises: Promise<void>[] = [];
     for (const event of events) {
       const attachment = event.message.attachment;
-      if (attachment?.status !== "found" || attachment.kind !== "video") continue;
-      const duration = Math.min(VIDEO_PREVIEW_SECONDS, this.media.getVideoDuration(attachment.archivePath) ?? VIDEO_PREVIEW_SECONDS);
-      const elapsed = clamp(time - event.at, 0, Math.max(0, duration - 0.001));
-      const active = time - event.at <= duration + 0.25;
-      if (active || !this.media.getVideoFrame(attachment.archivePath)) {
-        promises.push(this.media.prepareVideoFrame(attachment.archivePath, elapsed, exact));
+      if (attachment?.status !== "found") continue;
+      if (attachment.kind === "video") {
+        const duration = Math.min(MEDIA_PREVIEW_SECONDS, this.media.getVideoDuration(attachment.archivePath) ?? MEDIA_PREVIEW_SECONDS);
+        const elapsed = clamp(time - event.at, 0, Math.max(0, duration - 0.001));
+        const active = time - event.at <= duration + 0.25;
+        if (active || !this.media.getVideoFrame(attachment.archivePath)) {
+          promises.push(this.media.prepareVideoFrame(attachment.archivePath, elapsed, exact));
+        }
+      } else if (this.media.isAnimatedImage(attachment.archivePath)) {
+        const elapsed = clamp(time - event.at, 0, MEDIA_PREVIEW_SECONDS - 0.001);
+        if (time - event.at <= MEDIA_PREVIEW_SECONDS + 0.25 || !this.media.getAnimatedFrame(attachment.archivePath)) {
+          promises.push(this.media.prepareAnimatedFrame(attachment.archivePath, elapsed, exact));
+        }
       }
     }
     await Promise.all(promises);
@@ -536,14 +907,30 @@ export class ChatCanvasRenderer {
     const senderWidth = label ? ctx.measureText(label).width : 0;
     const hasVisual = message.attachment?.status === "found" && ["image", "sticker", "video"].includes(message.attachment.kind);
     const hasAttachment = Boolean(message.attachment);
-    const mediaHeight = hasVisual ? 360 * scale : hasAttachment ? 104 * scale : 0;
-    const baseWidth = hasVisual ? 650 * scale : hasAttachment ? 610 * scale : Math.max(190 * scale, textWidth + 58 * scale, senderWidth + 58 * scale);
+    let mediaWidth = 0;
+    let mediaHeight = 0;
+    if (hasVisual && message.attachment) {
+      const dimensions = this.media.getMediaDimensions(message.attachment.archivePath) ?? { width: 16, height: 9 };
+      const fitted = fitMediaBox(dimensions.width, dimensions.height, 690 * scale, 610 * scale);
+      mediaWidth = fitted.width;
+      mediaHeight = fitted.height;
+    } else if (hasAttachment) {
+      mediaWidth = 582 * scale;
+      mediaHeight = 92 * scale;
+    }
+    const baseWidth = Math.max(
+      190 * scale,
+      mediaWidth ? mediaWidth + 28 * scale : 0,
+      textWidth + 58 * scale,
+      senderWidth + 58 * scale,
+    );
     const width = Math.min(maxWidth, baseWidth);
     const senderHeight = label ? 34 * scale : 0;
     const textHeight = lines.length ? lines.length * 39 * scale + 8 * scale : 0;
-    const height = 28 * scale + senderHeight + mediaHeight + textHeight + 35 * scale;
+    const mediaSpacing = mediaHeight ? 12 * scale : 0;
+    const height = 28 * scale + senderHeight + mediaHeight + mediaSpacing + textHeight + 35 * scale;
     const dateLabel = !previous || dayKey(previous.timestamp) !== dayKey(message.timestamp) ? formatDay(message.timestamp) : undefined;
-    return { message, lines, senderLabel: label, width, height, mediaHeight, dateLabel };
+    return { message, lines, senderLabel: label, width, height, mediaWidth, mediaHeight, dateLabel };
   }
 
   private drawMessages(timeline: CompiledTimeline, time: number, theme: RenderTheme, palette: Palette, bottom: number, scale: number): void {
@@ -618,8 +1005,9 @@ export class ChatCanvasRenderer {
       cursorY += 34 * scale;
     }
     if (layout.mediaHeight > 0) {
-      this.drawMedia(layout, x + 14 * scale, cursorY, layout.width - 28 * scale, layout.mediaHeight - 12 * scale, palette, scale);
-      cursorY += layout.mediaHeight;
+      const mediaX = x + (layout.width - layout.mediaWidth) / 2;
+      this.drawMedia(layout, mediaX, cursorY, layout.mediaWidth, layout.mediaHeight, palette, scale);
+      cursorY += layout.mediaHeight + 12 * scale;
     }
     if (layout.lines.length) this.drawTextLines(layout.lines, x + 27 * scale, cursorY, layout.width - 54 * scale, palette, scale, false);
     ctx.fillStyle = palette.mutedText;
@@ -649,30 +1037,23 @@ export class ChatCanvasRenderer {
     ctx.fillStyle = palette.media;
     ctx.fillRect(x, y, width, height);
     const image = attachment?.archivePath ? this.media.getImage(attachment.archivePath) : undefined;
+    const animatedFrame = attachment?.archivePath ? this.media.getAnimatedFrame(attachment.archivePath) : undefined;
     const videoFrame = attachment?.kind === "video" && attachment.archivePath
       ? this.media.getVideoFrame(attachment.archivePath)
       : undefined;
-    if (image) {
-      const sourceW = "naturalWidth" in image ? image.naturalWidth : image.width;
-      const sourceH = "naturalHeight" in image ? image.naturalHeight : image.height;
-      const ratio = Math.max(width / sourceW, height / sourceH);
-      const drawW = sourceW * ratio;
-      const drawH = sourceH * ratio;
-      ctx.drawImage(image, x + (width - drawW) / 2, y + (height - drawH) / 2, drawW, drawH);
+    const audioClip = attachment?.kind === "audio" && attachment.archivePath
+      ? this.media.getAudioClip(attachment.archivePath)
+      : undefined;
+    if (audioClip) {
+      this.drawAudioMedia(layout, audioClip, x, y, width, height, palette, scale);
+    } else if (animatedFrame) {
+      ctx.drawImage(animatedFrame, x, y, width, height);
+    } else if (image) {
+      ctx.drawImage(image, x, y, width, height);
     } else if (videoFrame) {
-      const sourceW = videoFrame.displayWidth;
-      const sourceH = videoFrame.displayHeight;
-      const sourceRatio = sourceW / sourceH;
-      const targetRatio = width / height;
-      if (sourceRatio > targetRatio) {
-        const cropW = sourceH * targetRatio;
-        videoFrame.draw(ctx, (sourceW - cropW) / 2, 0, cropW, sourceH, x, y, width, height);
-      } else {
-        const cropH = sourceW / targetRatio;
-        videoFrame.draw(ctx, 0, (sourceH - cropH) / 2, sourceW, cropH, x, y, width, height);
-      }
+      videoFrame.draw(ctx, x, y, width, height);
       const eventAt = this.eventTimes.get(layout.message.id) ?? this.currentTime;
-      const clipDuration = Math.min(VIDEO_PREVIEW_SECONDS, this.media.getVideoDuration(attachment?.archivePath ?? "") ?? VIDEO_PREVIEW_SECONDS);
+      const clipDuration = Math.min(MEDIA_PREVIEW_SECONDS, this.media.getVideoDuration(attachment?.archivePath ?? "") ?? MEDIA_PREVIEW_SECONDS);
       const elapsed = clamp(this.currentTime - eventAt, 0, clipDuration);
       const progress = clipDuration > 0 ? elapsed / clipDuration : 0;
       ctx.fillStyle = "rgba(0, 0, 0, .28)";
@@ -698,5 +1079,49 @@ export class ChatCanvasRenderer {
       ctx.fillText(label.slice(0, 42), x + width / 2, y + height / 2 + 27 * scale);
     }
     ctx.restore();
+  }
+
+  private drawAudioMedia(
+    layout: BubbleLayout,
+    clip: PcmAudioClip,
+    x: number,
+    y: number,
+    width: number,
+    height: number,
+    palette: Palette,
+    scale: number,
+  ): void {
+    const ctx = this.ctx;
+    const eventAt = this.eventTimes.get(layout.message.id) ?? this.currentTime;
+    const elapsed = clamp(this.currentTime - eventAt, 0, clip.duration);
+    const progress = clip.duration > 0 ? elapsed / clip.duration : 0;
+    const active = this.currentTime >= eventAt && this.currentTime < eventAt + clip.duration;
+    const buttonX = x + 45 * scale;
+    const middleY = y + height / 2;
+    ctx.fillStyle = palette.accent;
+    ctx.beginPath();
+    ctx.arc(buttonX, middleY, 29 * scale, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = "#ffffff";
+    ctx.font = `600 ${21 * scale}px system-ui, sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(active ? "Ⅱ" : "▶", buttonX + (active ? 0 : 2 * scale), middleY);
+
+    const waveformX = x + 88 * scale;
+    const waveformWidth = Math.max(80 * scale, width - 184 * scale);
+    const barStep = waveformWidth / clip.peaks.length;
+    clip.peaks.forEach((peak, index) => {
+      const barProgress = (index + 0.5) / clip.peaks.length;
+      const barHeight = Math.max(5 * scale, peak * 45 * scale);
+      ctx.fillStyle = barProgress <= progress ? palette.accent : palette.mutedText;
+      ctx.fillRect(waveformX + index * barStep, middleY - barHeight / 2, Math.max(2 * scale, barStep * 0.42), barHeight);
+    });
+
+    ctx.fillStyle = palette.mutedText;
+    ctx.font = `500 ${18 * scale}px system-ui, sans-serif`;
+    ctx.textAlign = "right";
+    ctx.textBaseline = "middle";
+    ctx.fillText(`${Math.floor(elapsed / 60)}:${String(Math.floor(elapsed % 60)).padStart(2, "0")}`, x + width - 18 * scale, middleY);
   }
 }

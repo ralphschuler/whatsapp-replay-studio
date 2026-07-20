@@ -8,10 +8,20 @@ export const DEFAULT_TIMELINE_SETTINGS: TimelineSettings = {
   endHold: 2.5,
 };
 
-export const VIDEO_PREVIEW_SECONDS = 4;
+export const MEDIA_PREVIEW_SECONDS = 4;
+export const VIDEO_PREVIEW_SECONDS = MEDIA_PREVIEW_SECONDS;
+
+function isTimedMedia(message: ChatMessage): boolean {
+  const attachment = message.attachment;
+  if (!attachment || attachment.status !== "found") return false;
+  return attachment.kind === "video"
+    || attachment.kind === "audio"
+    || attachment.mimeType === "image/gif"
+    || /\.gif$/iu.test(attachment.displayName);
+}
 
 function readingBonus(message: ChatMessage): number {
-  if (message.attachment?.kind === "video") return VIDEO_PREVIEW_SECONDS;
+  if (isTimedMedia(message)) return MEDIA_PREVIEW_SECONDS;
   if (message.kind === "media") return 0.8;
   return Math.min(1.6, Math.max(0, message.text.length - 45) / 130);
 }
@@ -44,8 +54,8 @@ export function compileTimeline(
     return { message, messageIndex, at, revealDuration: 0.22 };
   });
   const lastMessage = messages[messages.length - 1];
-  const finalHold = lastMessage?.attachment?.kind === "video"
-    ? Math.max(settings.endHold, VIDEO_PREVIEW_SECONDS + 0.3)
+  const finalHold = lastMessage && isTimedMedia(lastMessage)
+    ? Math.max(settings.endHold, MEDIA_PREVIEW_SECONDS + 0.3)
     : settings.endHold;
   return { events, duration: at + finalHold };
 }
