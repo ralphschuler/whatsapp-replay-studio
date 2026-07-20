@@ -1,0 +1,22 @@
+{
+  "name": "whatsapp-replay-studio",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "jszip": "3.10.1",
+    "mediabunny": "1.50.9"
+  },
+  "devDependencies": {
+    "happy-dom": "^20.11.0",
+    "typescript": "5.9.3",
+    "vite": "8.1.5",
+    "vite-plugin-singlefile": "2.3.3",
+    "vitest": "4.1.10"
+  }
+}

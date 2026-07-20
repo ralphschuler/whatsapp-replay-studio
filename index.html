@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Lokales WhatsApp-Chat-Replay als MP4 erstellen" />
+    <title>WhatsApp Replay Studio</title>
+  </head>
+  <body>
+    <div id="app">
+      <header class="app-header">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">▶</span>
+          <div>
+            <h1>WhatsApp Replay Studio</h1>
+            <p>Vom Chat-Export zum animierten Replay-Video</p>
+          </div>
+        </div>
+        <div class="privacy-pill"><span aria-hidden="true">●</span> Bleibt auf deinem Gerät</div>
+      </header>
+
+      <main class="workspace">
+        <aside class="controls" aria-label="Replay-Einstellungen">
+          <section class="panel import-panel">
+            <div class="section-heading">
+              <span class="step">1</span>
+              <div><h2>Chat importieren</h2><p>WhatsApp-ZIP oder Chat-TXT</p></div>
+            </div>
+            <input id="file-input" class="visually-hidden" type="file" accept=".zip,.txt,application/zip,text/plain" />
+            <label id="drop-zone" class="drop-zone" for="file-input">
+              <span class="upload-icon" aria-hidden="true">⇧</span>
+              <strong>ZIP hier ablegen</strong>
+              <span>oder Datei auswählen</span>
+              <small>Export mit oder ohne Medien</small>
+            </label>
+            <button id="demo-button" class="text-button" type="button">Beispiel-Chat laden</button>
+            <div id="import-status" class="status-line" role="status" aria-live="polite"></div>
+          </section>
+
+          <div id="editor" class="editor" hidden>
+            <section class="panel summary-panel">
+              <div class="file-summary">
+                <span class="file-icon" aria-hidden="true">✓</span>
+                <div><strong id="file-name"></strong><span id="chat-file-name"></span></div>
+              </div>
+              <div class="stats-grid" aria-label="Importübersicht">
+                <div><strong id="stat-messages">0</strong><span>Nachrichten</span></div>
+                <div><strong id="stat-participants">0</strong><span>Personen</span></div>
+                <div><strong id="stat-media">0</strong><span>Medien</span></div>
+              </div>
+              <div id="diagnostic" class="notice" hidden></div>
+              <label class="field">
+                <span>Datumsformat</span>
+                <select id="date-order">
+                  <option value="auto">Automatisch</option>
+                  <option value="dmy">Tag / Monat / Jahr</option>
+                  <option value="mdy">Monat / Tag / Jahr</option>
+                  <option value="ymd">Jahr / Monat / Tag</option>
+                </select>
+              </label>
+            </section>
+
+            <section class="panel">
+              <div class="section-heading compact">
+                <span class="step">2</span><div><h2>Replay einrichten</h2><p>Person, Zeitraum und Timing</p></div>
+              </div>
+              <div class="field-grid">
+                <label class="field"><span>Meine Nachrichten</span><select id="self-name"></select></label>
+                <label class="field"><span>Chat-Titel</span><input id="chat-title" type="text" maxlength="48" /></label>
+              </div>
+              <div class="range-group">
+                <div class="range-label"><span>Start</span><strong id="start-label"></strong></div>
+                <input id="start-range" type="range" min="0" max="0" value="0" />
+                <div class="range-label"><span>Ende</span><strong id="end-label"></strong></div>
+                <input id="end-range" type="range" min="0" max="0" value="0" />
+              </div>
+              <div class="field-grid">
+                <label class="field"><span>Timing</span>
+                  <select id="timing-mode">
+                    <option value="adaptive">Adaptiv</option>
+                    <option value="fixed">Fester Takt</option>
+                    <option value="factor">Echter Zeitraffer</option>
+                  </select>
+                </label>
+                <label class="field"><span>Tempo</span>
+                  <select id="pace">
+                    <option value="1.6">Ruhig</option>
+                    <option value="1.05" selected>Normal</option>
+                    <option value="0.6">Schnell</option>
+                  </select>
+                </label>
+              </div>
+              <div id="factor-field" class="field" hidden>
+                <span>1 Videosekunde entspricht</span>
+                <select id="speed-factor">
+                  <option value="60">1 Minute Chat</option>
+                  <option value="300">5 Minuten Chat</option>
+                  <option value="3600" selected>1 Stunde Chat</option>
+                  <option value="21600">6 Stunden Chat</option>
+                  <option value="86400">1 Tag Chat</option>
+                </select>
+              </div>
+            </section>
+
+            <section class="panel">
+              <div class="section-heading compact">
+                <span class="step">3</span><div><h2>Look & Export</h2><p>Format und Darstellung</p></div>
+              </div>
+              <div class="field-grid">
+                <label class="field"><span>Videoformat</span>
+                  <select id="preset">
+                    <option value="portrait-720">9:16 · 720p</option>
+                    <option value="portrait-1080">9:16 · 1080p</option>
+                    <option value="square-1080">1:1 · 1080p</option>
+                    <option value="landscape-1080">16:9 · 1080p</option>
+                  </select>
+                </label>
+                <label class="field"><span>Chat-Theme</span>
+                  <select id="theme"><option value="dark">Dunkel</option><option value="light">Hell</option></select>
+                </label>
+              </div>
+              <label class="check-field"><input id="anonymize" type="checkbox" /><span>Namen im Video anonymisieren</span></label>
+              <label class="check-field"><input id="incoming-sound" type="checkbox" checked /><span>Eingangston („Ding“) für neue Nachrichten</span></label>
+              <div class="export-summary">
+                <span>Geschätzte Videolänge</span><strong id="duration-label">0:00</strong>
+              </div>
+              <button id="export-button" class="primary-button" type="button">MP4 erstellen</button>
+            </section>
+          </div>
+        </aside>
+
+        <section class="preview-area" aria-label="Video-Vorschau">
+          <div class="preview-heading">
+            <div><span class="eyebrow">LIVE-VORSCHAU</span><h2>Dein Chat-Replay</h2></div>
+            <span id="preview-resolution" class="resolution-badge">720 × 1280</span>
+          </div>
+          <div class="canvas-stage">
+            <canvas id="preview-canvas" width="720" height="1280" aria-label="Animierte Chat-Vorschau"></canvas>
+            <div id="empty-preview" class="empty-preview">
+              <span aria-hidden="true">↥</span>
+              <strong>Noch kein Chat geladen</strong>
+              <small>Importiere eine ZIP, um die Vorschau zu starten.</small>
+            </div>
+            <div id="render-overlay" class="render-overlay" hidden>
+              <div class="spinner" aria-hidden="true"></div>
+              <strong id="render-title">Video wird erstellt</strong>
+              <span id="render-detail">Vorbereitung …</span>
+              <progress id="render-progress" max="100" value="0"></progress>
+              <span id="render-percent">0 %</span>
+              <button id="cancel-export" class="secondary-button" type="button">Abbrechen</button>
+            </div>
+          </div>
+          <div class="player-controls">
+            <button id="play-button" class="play-button" type="button" aria-label="Vorschau abspielen" disabled>▶</button>
+            <span id="current-time">0:00</span>
+            <input id="scrubber" type="range" min="0" max="1" step="0.01" value="0" disabled aria-label="Wiedergabeposition" />
+            <span id="total-time">0:00</span>
+          </div>
+          <div id="download-card" class="download-card" hidden>
+            <div><strong>Dein MP4 ist fertig</strong><span id="download-meta"></span></div>
+            <a id="download-link" class="primary-button" download>Video herunterladen</a>
+          </div>
+          <p class="local-note"><span aria-hidden="true">◆</span> Der Import und das Rendering passieren vollständig in diesem Browser.</p>
+        </section>
+      </main>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
