@@ -1,14 +1,55 @@
-import { MEDIA_PREVIEW_SECONDS } from "./timeline";
 import type { CompiledTimeline, PcmAudioClip, ScheduledAudioAsset, ScheduledAudioClip } from "./types";
 import type { AudioBufferSource } from "mediabunny";
+import { messageDirection } from "./identity";
 
 const DING_DURATION = 0.46;
 const DING_SECOND_TONE_OFFSET = 0.105;
 const DING_TAIL = DING_DURATION + DING_SECOND_TONE_OFFSET;
+const PLAYBACK_SEGMENT_SECONDS = 8;
+
+export interface AudioSegmentRequest {
+  clipStart: number;
+  duration: number;
+  at: number;
+}
+
+export type AudioSegmentLoader = (
+  path: string,
+  start: number,
+  duration: number,
+) => Promise<PcmAudioClip | undefined>;
+
+export function audioSegmentForChunk(
+  scheduled: ScheduledAudioAsset,
+  chunkStart: number,
+  chunkDuration: number,
+): AudioSegmentRequest | undefined {
+  const overlapStart = Math.max(chunkStart, scheduled.at);
+  const overlapEnd = Math.min(chunkStart + chunkDuration, scheduled.at + scheduled.duration);
+  if (overlapEnd <= overlapStart) return undefined;
+  return {
+    clipStart: scheduled.clipStart + overlapStart - scheduled.at,
+    duration: overlapEnd - overlapStart,
+    at: overlapStart,
+  };
+}
+
+export function scheduleDecodedAudioSegment(
+  mediaStartAt: number,
+  cursor: number,
+  currentTime: number,
+  clipDuration: number,
+): { when: number; offset: number } | undefined {
+  const expectedStart = mediaStartAt + cursor;
+  const when = Math.max(expectedStart, currentTime + 0.02);
+  const offset = Math.max(0, when - expectedStart);
+  return offset < clipDuration ? { when, offset } : undefined;
+}
 
 export function incomingMessageTimes(timeline: CompiledTimeline, selfName: string): number[] {
   return timeline.events
-    .filter((event) => Boolean(event.message.sender) && event.message.sender !== selfName)
+    .filter((event) => messageDirection(event.message, selfName) === "incoming"
+      && (event.message.attachmentGroup?.index ?? 0) === 0)
     .map((event) => event.at);
 }
 
@@ -116,7 +157,7 @@ export async function streamReplayAudio(
   timeline: CompiledTimeline,
   selfName: string,
   scheduledAssets: ScheduledAudioAsset[],
-  loadClip: (path: string) => Promise<PcmAudioClip | undefined>,
+  loadClip: AudioSegmentLoader,
   incomingSound: boolean,
   signal?: AbortSignal,
   sampleRate = 48_000,
@@ -128,9 +169,13 @@ export async function streamReplayAudio(
     const duration = Math.min(chunkSeconds, timeline.duration - chunkStart);
     const scheduledClips: ScheduledAudioClip[] = [];
     for (const scheduled of scheduledAssets) {
-      if (scheduled.at >= chunkStart + duration || scheduled.at + MEDIA_PREVIEW_SECONDS <= chunkStart) continue;
-      const clip = await loadClip(scheduled.path);
-      if (clip) scheduledClips.push({ at: scheduled.at, clip });
+      const request = audioSegmentForChunk(scheduled, chunkStart, duration);
+      if (!request) continue;
+      const clip = await loadClip(scheduled.path, request.clipStart, request.duration);
+      if (!clip && scheduled.required) {
+        throw new Error(`Audiodatei „${scheduled.path.split("/").pop() ?? scheduled.path}“ konnte nicht vollständig dekodiert werden.`);
+      }
+      if (clip) scheduledClips.push({ at: request.at, clip });
     }
     const channels = mixReplayAudioChunk(duration, chunkStart, eventTimes, scheduledClips, sampleRate);
     const buffer = new AudioBuffer({ numberOfChannels: 2, length: channels.left.length, sampleRate });
@@ -187,6 +232,37 @@ export class DingPlayer {
     }
   }
 
+  async playStream(
+    path: string,
+    duration: number,
+    offset: number,
+    loadClip: AudioSegmentLoader,
+  ): Promise<void> {
+    try {
+      const generation = this.generation;
+      await this.unlock();
+      if (generation !== this.generation || !this.context || offset >= duration) return;
+      let cursor = Math.max(0, offset);
+      const mediaStartAt = this.context.currentTime - offset;
+      while (cursor < duration && generation === this.generation) {
+        const desiredStart = mediaStartAt + cursor;
+        while (desiredStart - this.context.currentTime > PLAYBACK_SEGMENT_SECONDS * 0.75) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 250));
+          if (generation !== this.generation) return;
+        }
+        const requested = Math.min(PLAYBACK_SEGMENT_SECONDS, duration - cursor);
+        const clip = await loadClip(path, cursor, requested);
+        if (generation !== this.generation || !this.context || !clip) return;
+        const buffer = this.audioBufferForClip(clip);
+        const schedule = scheduleDecodedAudioSegment(mediaStartAt, cursor, this.context.currentTime, clip.duration);
+        if (schedule) this.startBufferAt(buffer, schedule.offset, 1, schedule.when);
+        cursor += clip.duration;
+      }
+    } catch {
+      // A single unsupported media track must not stop the visual replay.
+    }
+  }
+
   stopAll(): void {
     this.generation += 1;
     for (const source of this.activeSources) {
@@ -197,6 +273,22 @@ export class DingPlayer {
   }
 
   private startBuffer(buffer: AudioBuffer, offset: number, volume: number): void {
+    this.startBufferAt(buffer, offset, volume, 0);
+  }
+
+  private audioBufferForClip(clip: PcmAudioClip): AudioBuffer {
+    if (!this.context) throw new Error("AudioContext ist nicht initialisiert");
+    let buffer = this.clipBuffers.get(clip);
+    if (!buffer) {
+      buffer = this.context.createBuffer(2, clip.left.length, clip.sampleRate);
+      buffer.copyToChannel(clip.left, 0);
+      buffer.copyToChannel(clip.right, 1);
+      this.clipBuffers.set(clip, buffer);
+    }
+    return buffer;
+  }
+
+  private startBufferAt(buffer: AudioBuffer, offset: number, volume: number, when: number): void {
     if (!this.context) return;
     const source = this.context.createBufferSource();
     const gain = this.context.createGain();
@@ -210,6 +302,6 @@ export class DingPlayer {
       gain.disconnect();
     };
     this.activeSources.add(source);
-    source.start(0, offset);
+    source.start(when, offset);
   }
 }
