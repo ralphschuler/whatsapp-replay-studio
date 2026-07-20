@@ -2,6 +2,10 @@
 
 Ein lokales Browser-Tool, das exportierte WhatsApp-Chats aus einer ZIP- oder TXT-Datei als animiertes MP4 rendert.
 
+[![Deploy GitHub Pages](https://github.com/ralphschuler/whatsapp-replay-studio/actions/workflows/deploy-pages.yml/badge.svg)](https://github.com/ralphschuler/whatsapp-replay-studio/actions/workflows/deploy-pages.yml)
+
+**Online-Version:** [WhatsApp Replay Studio öffnen](https://nyphon.de/whatsapp-replay-studio/)
+
 ## Direkt verwenden
 
 Die gebaute Datei `dist/index.html` ist vollständig eigenständig. Sie kann per Doppelklick in einem aktuellen Chrome-, Edge- oder Safari-Browser geöffnet werden. Der Chat und alle Medien bleiben im Browser und werden nicht hochgeladen.
@@ -34,6 +38,12 @@ npm run build
 ```
 
 Voraussetzung ist Node.js 20 oder neuer. Der Build bündelt alle Abhängigkeiten in eine einzelne `dist/index.html`.
+
+## GitHub Pages
+
+Der Workflow `.github/workflows/deploy-pages.yml` führt bei jedem Push auf `main` zuerst Tests und Build aus und veröffentlicht anschließend `dist/` über GitHub Pages. Er kann außerdem über **Actions → Deploy GitHub Pages → Run workflow** manuell gestartet werden.
+
+Bei der ersten Einrichtung muss unter **Settings → Pages → Build and deployment → Source** einmalig **GitHub Actions** ausgewählt sein.
 
 ## Grenzen des MVP
 
