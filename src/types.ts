@@ -2,6 +2,42 @@ export type DateOrder = "auto" | "dmy" | "mdy" | "ymd";
 
 export type MediaKind = "image" | "video" | "audio" | "document" | "sticker";
 
+export type SemanticMessageType =
+  | "call"
+  | "location"
+  | "contact"
+  | "poll"
+  | "reaction"
+  | "payment"
+  | "link"
+  | "invite"
+  | "business"
+  | "template"
+  | "interactive"
+  | "event"
+  | "view-once"
+  | "unsupported";
+
+export interface MessageSemantic {
+  type: SemanticMessageType;
+  variant?: string;
+  title: string;
+  detail?: string;
+  body?: string;
+  items?: string[];
+}
+
+export type MediaPresentationRole =
+  | "photo"
+  | "animated-image"
+  | "sticker"
+  | "video"
+  | "video-note"
+  | "audio"
+  | "voice-note"
+  | "document"
+  | "contact";
+
 export interface Attachment {
   archivePath: string;
   displayName: string;
@@ -9,6 +45,13 @@ export interface Attachment {
   mimeType: string;
   size: number;
   status: "found" | "missing" | "ambiguous";
+}
+
+export interface AttachmentGroup {
+  id: string;
+  index: number;
+  size: number;
+  kind: "explicit-multi";
 }
 
 export interface ChatMessage {
@@ -19,10 +62,19 @@ export interface ChatMessage {
   precision: "minute" | "second";
   sender: string | null;
   text: string;
+  displayText?: string;
   kind: "text" | "system" | "media" | "media-omitted" | "deleted" | "unknown";
+  semantic?: MessageSemantic;
+  forwarded?: boolean;
+  frequentlyForwarded?: boolean;
+  edited?: boolean;
+  quotedText?: string;
   mediaHint?: MediaKind;
   mediaReference?: string;
+  mediaRole?: MediaPresentationRole;
   attachment?: Attachment;
+  attachmentGroup?: AttachmentGroup;
+  logicalMessageId?: string;
   warnings: string[];
 }
 
@@ -83,6 +135,7 @@ export interface TimelineEvent {
   messageIndex: number;
   at: number;
   revealDuration: number;
+  mediaDuration?: number;
 }
 
 export interface CompiledTimeline {
@@ -98,6 +151,11 @@ export interface PcmAudioClip {
   peaks: number[];
 }
 
+export interface AudioMediaInfo {
+  duration: number;
+  peaks: number[];
+}
+
 export interface ScheduledAudioClip {
   at: number;
   clip: PcmAudioClip;
@@ -106,6 +164,9 @@ export interface ScheduledAudioClip {
 export interface ScheduledAudioAsset {
   at: number;
   path: string;
+  duration: number;
+  clipStart: number;
+  required: boolean;
 }
 
 export interface RenderTheme {

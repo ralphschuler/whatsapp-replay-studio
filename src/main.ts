@@ -4,7 +4,7 @@ import { exportReplayMp4, type ExportProgress } from "./exporter";
 import { importWhatsAppExport, reparseProject } from "./importer";
 import { parseChat } from "./parser";
 import { AssetMediaStore, ChatCanvasRenderer } from "./renderer";
-import { compileTimeline, DEFAULT_TIMELINE_SETTINGS, formatDuration, MEDIA_PREVIEW_SECONDS } from "./timeline";
+import { compileTimeline, DEFAULT_TIMELINE_SETTINGS, formatDuration } from "./timeline";
 import type {
   CompiledTimeline,
   DateOrder,
@@ -72,6 +72,10 @@ let animationFrame = 0;
 let exportController: AbortController | null = null;
 let downloadUrl = "";
 let preparingPreview = false;
+let pendingPreviewRequest: { renderer: ChatCanvasRenderer; timeline: CompiledTimeline; time: number } | null = null;
+let mediaPreparationGeneration = 0;
+let mediaReady = false;
+let baseDiagnostics = "";
 let previousPlaybackTime = 0;
 let playbackGeneration = 0;
 const playedAudioEvents = new Set<string>();
@@ -101,9 +105,22 @@ function currentTimelineSettings(): TimelineSettings {
 
 function selectedMessages() {
   if (!project) return [];
-  const start = Number(startRange.value);
-  const end = Number(endRange.value);
-  return project.chat.messages.slice(start, end + 1);
+  const groups = logicalMessageGroups(project.chat.messages);
+  const startGroup = groups[Number(startRange.value)];
+  const endGroup = groups[Number(endRange.value)];
+  if (!startGroup || !endGroup) return [];
+  return project.chat.messages.slice(startGroup.startIndex, endGroup.endIndex + 1);
+}
+
+function logicalMessageGroups(messages: ImportedProject["chat"]["messages"]): Array<{ startIndex: number; endIndex: number }> {
+  const groups: Array<{ key: string; startIndex: number; endIndex: number }> = [];
+  messages.forEach((message, index) => {
+    const key = message.logicalMessageId ?? message.id;
+    const previous = groups.at(-1);
+    if (previous?.key === key) previous.endIndex = index;
+    else groups.push({ key, startIndex: index, endIndex: index });
+  });
+  return groups;
 }
 
 function formatDateTime(date: Date): string {
@@ -143,9 +160,9 @@ function setExportBusy(busy: boolean): void {
   ];
   for (const control of controls) control.disabled = busy;
   if (!busy) {
-    playButton.disabled = !project;
+    playButton.disabled = !project || !mediaReady;
     scrubber.disabled = !project;
-    exportButton.disabled = !project;
+    exportButton.disabled = !project || !mediaReady;
   }
   dropZone.classList.toggle("is-disabled", busy);
   dropZone.setAttribute("aria-disabled", String(busy));
@@ -172,16 +189,25 @@ function updateRangeLabels(): void {
   if (!project) return;
   const startIndex = Number(startRange.value);
   const endIndex = Number(endRange.value);
-  const startMessage = project.chat.messages[startIndex];
-  const endMessage = project.chat.messages[endIndex];
+  const groups = logicalMessageGroups(project.chat.messages);
+  const startMessage = project.chat.messages[groups[startIndex]?.startIndex ?? -1];
+  const endMessage = project.chat.messages[groups[endIndex]?.endIndex ?? -1];
   setText("start-label", startMessage ? `${startIndex + 1} · ${formatDateTime(startMessage.timestamp)}` : "–");
   setText("end-label", endMessage ? `${endIndex + 1} · ${formatDateTime(endMessage.timestamp)}` : "–");
 }
 
-function updateTimeline(resetPosition = false): void {
+function updateTimeline(resetPosition = false, preserveAbsoluteTime = false): void {
+  if (playing) stopPlayback();
+  const previousTime = currentTime;
   const previousRatio = timeline.duration ? currentTime / timeline.duration : 0;
-  timeline = compileTimeline(selectedMessages(), currentTimelineSettings());
-  currentTime = resetPosition ? 0 : Math.min(timeline.duration, previousRatio * timeline.duration);
+  timeline = compileTimeline(
+    selectedMessages(),
+    currentTimelineSettings(),
+    mediaStore?.getKnownMediaDurations() ?? new Map(),
+  );
+  currentTime = resetPosition
+    ? 0
+    : Math.min(timeline.duration, preserveAbsoluteTime ? previousTime : previousRatio * timeline.duration);
   scrubber.max = String(Math.max(0.01, timeline.duration));
   scrubber.value = String(currentTime);
   setText("duration-label", formatDuration(timeline.duration));
@@ -191,20 +217,30 @@ function updateTimeline(resetPosition = false): void {
   redraw();
 }
 
+async function flushPreviewRequests(): Promise<void> {
+  if (preparingPreview) return;
+  preparingPreview = true;
+  try {
+    while (pendingPreviewRequest) {
+      const request = pendingPreviewRequest;
+      pendingPreviewRequest = null;
+      await request.renderer.prepareFrame(request.timeline, request.time);
+      if (renderer === request.renderer && timeline === request.timeline) {
+        request.renderer.render(request.timeline, currentTime, currentTheme());
+      }
+    }
+  } finally {
+    preparingPreview = false;
+  }
+}
+
 function redraw(): void {
   if (!renderer || !timeline.events.length) return;
   renderer.render(timeline, currentTime, currentTheme());
   setText("current-time", formatDuration(currentTime));
   scrubber.value = String(currentTime);
-  if (!preparingPreview) {
-    preparingPreview = true;
-    const activeRenderer = renderer;
-    void activeRenderer.prepareFrame(timeline, currentTime)
-      .then(() => {
-        if (renderer === activeRenderer) activeRenderer.render(timeline, currentTime, currentTheme());
-      })
-      .finally(() => { preparingPreview = false; });
-  }
+  pendingPreviewRequest = { renderer, timeline, time: currentTime };
+  void flushPreviewRequests();
 }
 
 function stopPlayback(): void {
@@ -219,15 +255,20 @@ function stopPlayback(): void {
 async function playAttachedAudio(event: TimelineEvent, generation: number): Promise<void> {
   const attachment = event.message.attachment;
   const activeStore = mediaStore;
-  if (!activeStore || attachment?.status !== "found" || attachment.kind !== "audio") return;
-  await activeStore.load(attachment.archivePath);
+  if (!activeStore || attachment?.status !== "found" || !["audio", "video"].includes(attachment.kind)) return;
+  const timing = activeStore.getAudioTiming(attachment.archivePath);
+  if (!timing) return;
   if (!playing || generation !== playbackGeneration || mediaStore !== activeStore) return;
-  const clip = activeStore.getAudioClip(attachment.archivePath);
-  const offset = currentTime - event.at;
+  const offset = currentTime - (event.at + timing.startOffset);
   const eventKey = `${event.message.id}@${event.at}`;
-  if (clip && offset >= 0 && offset < clip.duration && !playedAudioEvents.has(eventKey)) {
+  if (offset < timing.duration && !playedAudioEvents.has(eventKey)) {
     playedAudioEvents.add(eventKey);
-    void audioPlayer.playClip(clip, offset);
+    void audioPlayer.playStream(
+      attachment.archivePath,
+      timing.duration,
+      offset,
+      (path, start, segmentDuration) => activeStore.loadAudioSegment(path, start, segmentDuration),
+    );
   }
 }
 
@@ -247,15 +288,21 @@ function playbackFrame(now: number): void {
       event.at > Math.max(before, previousPlaybackTime) && event.at <= currentTime,
     );
     const hasIncoming = crossedEvents.some((event) =>
-      Boolean(event.message.sender) && event.message.sender !== selfSelect.value,
+      Boolean(event.message.sender)
+      && event.message.sender !== selfSelect.value
+      && (event.message.attachmentGroup?.index ?? 0) === 0,
     );
     if (incomingSoundInput.checked && hasIncoming) void audioPlayer.play();
     for (const event of crossedEvents) {
-      if (event.message.attachment?.kind === "audio") void playAttachedAudio(event, generation);
+      if (["audio", "video"].includes(event.message.attachment?.kind ?? "")) void playAttachedAudio(event, generation);
     }
   }
   previousPlaybackTime = currentTime;
   redraw();
+}
+
+function logicalMessageCount(messages: ImportedProject["chat"]["messages"]): number {
+  return logicalMessageGroups(messages).length;
 }
 
 function togglePlayback(): void {
@@ -276,10 +323,14 @@ function togglePlayback(): void {
   playButton.setAttribute("aria-label", "Vorschau pausieren");
   void audioPlayer.unlock();
   for (const event of timeline.events) {
+    const duration = event.mediaDuration ?? (event.message.attachment
+      ? mediaStore?.getPlaybackDuration(event.message.attachment.archivePath)
+      : undefined);
     if (
       event.at > currentTime ||
-      currentTime - event.at >= MEDIA_PREVIEW_SECONDS ||
-      event.message.attachment?.kind !== "audio"
+      !duration ||
+      currentTime - event.at >= duration ||
+      !["audio", "video"].includes(event.message.attachment?.kind ?? "")
     ) continue;
     void playAttachedAudio(event, generation);
   }
@@ -287,13 +338,32 @@ function togglePlayback(): void {
 }
 
 async function prepareMediaForPreview(): Promise<void> {
-  if (!mediaStore || !timeline.events.length) return;
-  await mediaStore.preloadForMessages(timeline.events.map((event) => event.message));
+  const activeStore = mediaStore;
+  const activeProject = project;
+  if (!activeStore || !activeProject || !timeline.events.length) return;
+  const generation = ++mediaPreparationGeneration;
+  await activeStore.preloadForMessages(activeProject.chat.messages);
+  if (generation !== mediaPreparationGeneration || mediaStore !== activeStore || project !== activeProject) return;
+  updateTimeline(false, true);
+  const mediaIssues = activeStore.getMediaIssues(activeProject.chat.messages);
+  const diagnostic = element<HTMLDivElement>("diagnostic");
+  diagnostic.textContent = [baseDiagnostics, ...mediaIssues].filter(Boolean).join(" ");
+  diagnostic.hidden = !diagnostic.textContent;
+  mediaReady = true;
+  setExportBusy(false);
+  setStatus(
+    mediaIssues.length
+      ? `${logicalMessageCount(activeProject.chat.messages).toLocaleString("de-DE")} Nachrichten sind bereit; ${mediaIssues.length} Medienhinweis${mediaIssues.length === 1 ? "" : "e"}.`
+      : `${logicalMessageCount(activeProject.chat.messages).toLocaleString("de-DE")} Nachrichten und Medienlängen sind bereit.`,
+    mediaIssues.length ? "info" : "success",
+  );
   redraw();
 }
 
 function populateProject(nextProject: ImportedProject, keepTitle = false): void {
   stopPlayback();
+  mediaPreparationGeneration += 1;
+  mediaReady = false;
   project = nextProject;
   setExportBusy(false);
   mediaStore?.dispose();
@@ -302,11 +372,10 @@ function populateProject(nextProject: ImportedProject, keepTitle = false): void 
   renderer.setParticipants(project.chat.participants);
   emptyPreview.hidden = true;
   editor.hidden = false;
-  playButton.disabled = false;
   scrubber.disabled = false;
   setText("file-name", project.filename);
   setText("chat-file-name", project.chatFilename);
-  setText("stat-messages", project.chat.messages.length.toLocaleString("de-DE"));
+  setText("stat-messages", logicalMessageCount(project.chat.messages).toLocaleString("de-DE"));
   setText("stat-participants", String(project.chat.participants.length));
   setText("stat-media", String(project.attachmentStats.matched));
   if (!keepTitle) titleInput.value = sanitizeTitle(project.filename);
@@ -319,7 +388,7 @@ function populateProject(nextProject: ImportedProject, keepTitle = false): void 
     selfSelect.append(option);
   }
 
-  const max = Math.max(0, project.chat.messages.length - 1);
+  const max = Math.max(0, logicalMessageCount(project.chat.messages) - 1);
   startRange.max = String(max);
   endRange.max = String(max);
   startRange.value = "0";
@@ -328,12 +397,13 @@ function populateProject(nextProject: ImportedProject, keepTitle = false): void 
   if (project.attachmentStats.missing) warnings.push(`${project.attachmentStats.missing} referenzierte Medien wurden nicht gefunden.`);
   if (project.attachmentStats.ambiguous) warnings.push(`${project.attachmentStats.ambiguous} Mediennamen sind mehrfach vorhanden.`);
   const diagnostic = element<HTMLDivElement>("diagnostic");
-  diagnostic.hidden = warnings.length === 0;
-  diagnostic.textContent = warnings.join(" ");
+  baseDiagnostics = warnings.join(" ");
+  diagnostic.hidden = !baseDiagnostics;
+  diagnostic.textContent = baseDiagnostics;
   dateOrderSelect.value = project.chat.diagnostics.dateOrderAmbiguous ? "auto" : project.chat.diagnostics.dateOrder;
   applyCanvasPreset();
   updateTimeline(true);
-  setStatus(`${project.chat.messages.length.toLocaleString("de-DE")} Nachrichten erfolgreich importiert.`, "success");
+  setStatus(`${logicalMessageCount(project.chat.messages).toLocaleString("de-DE")} Nachrichten importiert; Medienlängen werden gelesen …`);
   void prepareMediaForPreview();
 }
 
@@ -387,14 +457,22 @@ async function startExport(): Promise<void> {
   renderProgress.value = 0;
   setText("render-percent", "0 %");
   setText("render-title", "Video wird erstellt");
-  setText("render-detail", "Vorbereitung …");
+  setText("render-detail", "Medienlängen werden gelesen …");
   try {
+    const activeStore = mediaStore;
+    const activeProject = project;
+    await activeStore.preloadForMessages(selectedMessages(), (done, total) => {
+      const progress = total ? done / total : 1;
+      handleExportProgress({ phase: "prepare", progress: progress * 0.08, frame: done, totalFrames: total });
+    });
+    if (mediaStore !== activeStore || project !== activeProject) throw new Error("Das Projekt wurde während der Vorbereitung gewechselt.");
+    updateTimeline(false, true);
     const blob = await exportReplayMp4({
-      project,
+      project: activeProject,
       timeline,
       preset: currentPreset(),
       theme: currentTheme(),
-      mediaStore,
+      mediaStore: activeStore,
       incomingSound: incomingSoundInput.checked,
       signal: exportController.signal,
       onProgress: handleExportProgress,

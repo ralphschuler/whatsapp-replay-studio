@@ -1,6 +1,8 @@
 import { ALL_FORMATS, AudioBufferSink, BlobSource, Input, VideoSample, VideoSampleSink } from "mediabunny";
-import { MEDIA_PREVIEW_SECONDS, visibleEventCount } from "./timeline";
+import { visibleEventCount } from "./timeline";
+import { parseVCard, type ContactCardInfo } from "./vcard";
 import type {
+  AudioMediaInfo,
   ArchiveAsset,
   ChatMessage,
   CompiledTimeline,
@@ -28,6 +30,13 @@ interface VideoDecoderEntry {
   exportFallback: boolean;
 }
 
+interface AudioDecoderEntry extends AudioMediaInfo {
+  input: Input<BlobSource>;
+  sink: AudioBufferSink;
+  firstTimestamp: number;
+  startOffset: number;
+}
+
 interface AnimatedImageEntry {
   decoder: ImageDecoder;
   width: number;
@@ -39,14 +48,31 @@ interface AnimatedImageEntry {
   pending: Promise<void> | null;
 }
 
+export interface MessageCardPresentation {
+  type: "call" | "location" | "contact" | "poll" | "reaction" | "payment" | "link" | "invite" | "business" | "interactive" | "template" | "event" | "view-once" | "unsupported" | "deleted" | "omitted";
+  icon: string;
+  title: string;
+  detail?: string;
+  body?: string;
+  items: string[];
+  accent: string;
+}
+
 interface BubbleLayout {
   message: ChatMessage;
   lines: string[];
+  quoteLines: string[];
   senderLabel: string;
   width: number;
   height: number;
   mediaWidth: number;
   mediaHeight: number;
+  card?: MessageCardPresentation;
+  cardDetailLines: string[];
+  cardItemLines: string[][];
+  cardItemHeights: number[];
+  cardWidth: number;
+  cardHeight: number;
   dateLabel?: string;
 }
 
@@ -59,6 +85,15 @@ export function fitMediaBox(
   if (sourceWidth <= 0 || sourceHeight <= 0) return { width: maxWidth, height: Math.min(maxHeight, maxWidth * 9 / 16) };
   const factor = Math.min(maxWidth / sourceWidth, maxHeight / sourceHeight);
   return { width: sourceWidth * factor, height: sourceHeight * factor };
+}
+
+export function shouldRenderCircularVideoNote(
+  role: ChatMessage["mediaRole"],
+  width: number,
+  height: number,
+): boolean {
+  if (role !== "video-note" || width <= 0 || height <= 0) return false;
+  return Math.abs(width - height) / Math.max(width, height) <= 0.08;
 }
 
 export function canvasScale(width: number, height: number): number {
@@ -76,8 +111,204 @@ export function animatedFrameIndex(frameDurations: number[], time: number, total
   return frameDurations.length - 1;
 }
 
+export const MAX_ANIMATED_IMAGE_FRAMES = 5_000;
+export const MAX_ANIMATED_CYCLE_SECONDS = 15 * 60;
+export const MAX_ANIMATED_DECODE_PIXELS = 2_000_000_000;
+
+/**
+ * Bounds the CPU work needed to inspect an animation. A rejected animation is
+ * rendered through the existing static first-frame fallback; it is never
+ * presented as a misleading partial loop.
+ */
+export function isSafeAnimatedImageCycle(
+  frameCount: number,
+  decodedPixels: number,
+  duration: number,
+): boolean {
+  return Number.isInteger(frameCount)
+    && frameCount >= 1
+    && frameCount <= MAX_ANIMATED_IMAGE_FRAMES
+    && Number.isFinite(decodedPixels)
+    && decodedPixels >= 0
+    && decodedPixels <= MAX_ANIMATED_DECODE_PIXELS
+    && Number.isFinite(duration)
+    && duration >= 0
+    && duration <= MAX_ANIMATED_CYCLE_SECONDS;
+}
+
+export function isFirstAttachmentGroupItem(message: ChatMessage): boolean {
+  const group = message.attachmentGroup;
+  return !group || group.size <= 1 || group.index <= 0;
+}
+
+export function isLastAttachmentGroupItem(message: ChatMessage): boolean {
+  const group = message.attachmentGroup;
+  return !group || group.size <= 1 || group.index >= group.size - 1;
+}
+
+export function attachmentGroupIndexLabel(message: ChatMessage): string | undefined {
+  const group = message.attachmentGroup;
+  if (!group || group.size <= 1 || group.index < 0 || group.index >= group.size) return undefined;
+  return `${group.index + 1}/${group.size}`;
+}
+
+export function messagesShareAttachmentGroup(current: ChatMessage, next: ChatMessage | undefined): boolean {
+  const currentGroup = current.attachmentGroup;
+  const nextGroup = next?.attachmentGroup;
+  return Boolean(
+    currentGroup
+    && nextGroup
+    && currentGroup.size > 1
+    && currentGroup.id === nextGroup.id
+    && nextGroup.index === currentGroup.index + 1,
+  );
+}
+
+export function messageGapAfter(current: ChatMessage, next: ChatMessage | undefined, scale = 1): number {
+  return (messagesShareAttachmentGroup(current, next) ? 5 : 15) * scale;
+}
+
+export function shouldShowMessageTimestamp(message: ChatMessage): boolean {
+  return isLastAttachmentGroupItem(message);
+}
+
+export function forwardedPresentationLabel(message: ChatMessage): string | undefined {
+  if (!isFirstAttachmentGroupItem(message)) return undefined;
+  if (message.frequentlyForwarded) return "↪  HÄUFIG WEITERGELEITET";
+  return message.forwarded ? "↪  WEITERGELEITET" : undefined;
+}
+
+export function combinedPlaybackDuration(
+  videoDuration: number | undefined,
+  audioDuration: number | undefined,
+  audioStartOffset = 0,
+): number | undefined {
+  const videoEnd = Number.isFinite(videoDuration) && (videoDuration ?? 0) > 0 ? videoDuration : undefined;
+  const audioEnd = Number.isFinite(audioDuration) && (audioDuration ?? 0) > 0
+    ? Math.max(0, audioStartOffset + (audioDuration ?? 0))
+    : undefined;
+  if (videoEnd === undefined) return audioEnd;
+  if (audioEnd === undefined) return videoEnd;
+  return Math.max(videoEnd, audioEnd);
+}
+
+export function oversizedBubbleScrollOffset(
+  entryHeight: number,
+  availableHeight: number,
+  elapsed: number,
+  displaySpan: number,
+): number {
+  const overflow = Math.max(0, entryHeight - availableHeight);
+  if (!overflow) return 0;
+  const span = Math.max(0.8, displaySpan);
+  const progress = clamp((elapsed - 0.35) / Math.max(0.25, span - 0.7), 0, 1);
+  return overflow * (1 - progress);
+}
+
+export function messageCardPresentation(message: ChatMessage): MessageCardPresentation | undefined {
+  const semantic = message.semantic;
+  if (semantic) {
+    const styles: Record<typeof semantic.type, { icon: string; accent: string }> = {
+      call: { icon: semantic.variant?.includes("video") ? "▰" : "☎", accent: "#25a56a" },
+      location: { icon: "●", accent: "#348dcc" },
+      contact: { icon: "●", accent: "#7c5ac7" },
+      poll: { icon: "▥", accent: "#00a884" },
+      reaction: { icon: "♥", accent: "#e09f25" },
+      payment: {
+        icon: "€",
+        accent: ["failed", "cancelled", "expired"].includes(semantic.variant ?? "")
+          ? "#d86b65"
+          : ["pending", "requested"].includes(semantic.variant ?? "") ? "#e09f25" : "#25a56a",
+      },
+      link: { icon: "↗", accent: "#348dcc" },
+      invite: { icon: "+", accent: "#25a56a" },
+      business: { icon: "▤", accent: "#7c5ac7" },
+      interactive: { icon: "☷", accent: "#00a884" },
+      template: { icon: "▤", accent: "#7c5ac7" },
+      event: { icon: semantic.variant?.startsWith("rsvp") || semantic.variant === "chat-event" ? "▦" : "i", accent: semantic.variant?.startsWith("rsvp") || semantic.variant === "chat-event" ? "#7c5ac7" : "#647985" },
+      "view-once": { icon: "1", accent: "#7c5ac7" },
+      unsupported: { icon: "!", accent: "#d97706" },
+    };
+    const style = styles[semantic.type];
+    return {
+      type: semantic.type,
+      icon: style.icon,
+      title: semantic.title,
+      detail: semantic.detail,
+      body: semantic.body,
+      items: semantic.items ?? [],
+      accent: style.accent,
+    };
+  }
+  if (message.kind === "deleted") {
+    const mine = /^(?:you deleted|du hast)/iu.test(message.text.replace(/[\u200E\u200F]/gu, "").trim());
+    return {
+      type: "deleted",
+      icon: "⌫",
+      title: mine ? "Von dir gelöscht" : "Nachricht gelöscht",
+      detail: "Der ursprüngliche Inhalt ist nicht im Export enthalten.",
+      items: [],
+      accent: "#75858e",
+    };
+  }
+  if (message.kind === "media-omitted" && !message.attachment) {
+    const labels = { image: "Bild", video: "Video", audio: "Audio", sticker: "Sticker", document: "Dokument" } as const;
+    const roleLabel = message.mediaRole === "voice-note"
+      ? "Sprachnachricht"
+      : message.mediaRole === "video-note"
+        ? "Videonotiz"
+        : message.mediaRole === "animated-image"
+          ? "GIF / Animation"
+          : message.mediaRole === "contact"
+            ? "Kontaktkarte"
+          : undefined;
+    return {
+      type: "omitted",
+      icon: "▧",
+      title: roleLabel ? `${roleLabel} nicht enthalten` : message.mediaHint ? `${labels[message.mediaHint]} nicht enthalten` : "Medium nicht enthalten",
+      detail: "WhatsApp hat für diesen Eintrag keine eindeutig zuordenbare Datei exportiert.",
+      body: (message.displayText ?? message.text).split("\n").slice(1).join("\n").trim() || undefined,
+      items: [],
+      accent: "#75858e",
+    };
+  }
+  return undefined;
+}
+
+export function attachmentCardPresentation(message: ChatMessage): { icon: string; title: string; detail: string } | undefined {
+  const attachment = message.attachment;
+  if (!attachment) return undefined;
+  const extension = attachment.displayName.includes(".")
+    ? attachment.displayName.split(".").pop()?.toLocaleUpperCase() ?? "DATEI"
+    : "DATEI";
+  if (attachment.status === "missing") return { icon: "!", title: "DATEI FEHLT", detail: attachment.displayName };
+  if (attachment.status === "ambiguous") return { icon: "?", title: "DATEI NICHT EINDEUTIG", detail: attachment.displayName };
+  if (message.mediaRole === "contact" || /\.(?:vcf|vcard)$/iu.test(attachment.displayName)) return { icon: "●", title: "KONTAKT", detail: attachment.displayName };
+  if (message.mediaRole === "voice-note") return { icon: "▶", title: "SPRACHNACHRICHT", detail: attachment.displayName };
+  if (message.mediaRole === "video-note") return { icon: "▶", title: "VIDEONOTIZ", detail: attachment.displayName };
+  if (message.mediaRole === "animated-image") return { icon: "▧", title: "GIF / ANIMATION", detail: attachment.displayName };
+  if (attachment.kind === "document") return { icon: "▤", title: `${extension}-DOKUMENT`, detail: attachment.displayName };
+  if (attachment.kind === "video") return { icon: "▶", title: "VIDEO", detail: attachment.displayName };
+  if (attachment.kind === "audio") return { icon: "▶", title: "AUDIO", detail: attachment.displayName };
+  return { icon: "▧", title: attachment.kind === "sticker" ? "STICKER" : "BILD", detail: attachment.displayName };
+}
+
 const AUDIO_SAMPLE_RATE = 48_000;
-const MAX_CACHED_AUDIO_CLIPS = 24;
+const AUDIO_SEGMENT_SECONDS = 8;
+const MAX_DECODABLE_MEDIA_BYTES = 750 * 1024 * 1024;
+const MAX_MEDIA_DIMENSION = 32_768;
+const MAX_MEDIA_PIXELS = 80_000_000;
+
+function assertSafeMediaDimensions(width: number, height: number): void {
+  if (
+    !Number.isFinite(width) || !Number.isFinite(height) ||
+    width <= 0 || height <= 0 ||
+    width > MAX_MEDIA_DIMENSION || height > MAX_MEDIA_DIMENSION ||
+    width * height > MAX_MEDIA_PIXELS
+  ) {
+    throw new Error(`Unsichere Medienabmessungen: ${width} × ${height}`);
+  }
+}
 
 function mixAudioBuffer(
   left: Float32Array<ArrayBuffer>,
@@ -117,6 +348,10 @@ function waveformPeaks(left: Float32Array<ArrayBuffer>, right: Float32Array<Arra
     result.push(Math.min(1, Math.max(0.08, peak)));
   }
   return result;
+}
+
+function placeholderWaveformPeaks(count = 42): number[] {
+  return Array.from({ length: count }, (_, index) => 0.12 + Math.abs(Math.sin((index + 1) * 1.37)) * 0.18);
 }
 
 interface Palette {
@@ -171,6 +406,16 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
+function graphemes(value: string): string[] {
+  const Segmenter = (Intl as unknown as {
+    Segmenter?: new (locale?: string, options?: { granularity: "grapheme" }) => {
+      segment(input: string): Iterable<{ segment: string }>;
+    };
+  }).Segmenter;
+  if (!Segmenter) return Array.from(value);
+  return Array.from(new Segmenter(undefined, { granularity: "grapheme" }).segment(value), ({ segment }) => segment);
+}
+
 function easeOut(value: number): number {
   return 1 - Math.pow(1 - clamp(value, 0, 1), 3);
 }
@@ -206,14 +451,20 @@ function formatTime(date: Date): string {
 }
 
 export function cleanMediaCaption(message: ChatMessage): string {
-  if (!message.attachment) return message.text;
-  const withoutTag = message.text
-    .replace(/[\u200E\u200F]?\s*<[^:>\n]{1,48}:\s*[^>\n]+\.(?:jpe?g|png|gif|webp|heic|heif|mp4|mov|m4v|webm|opus|ogg|m4a|mp3|aac|wav|pdf|docx?|xlsx?|pptx?|zip)>/iu, "")
-    .replace(/^.*\.(?:jpe?g|png|webp|gif|heic|mp4|mov|webm|opus|ogg|m4a|mp3|pdf).*\((?:file attached|datei angehängt)\)\s*/iu, "")
+  const sourceText = message.displayText ?? message.text;
+  if (!message.attachment) return sourceText;
+  const normalizedText = sourceText.replace(/[\u200E\u200F]/gu, "").trim().normalize("NFC").toLocaleLowerCase();
+  const normalizedReference = (message.mediaReference ?? message.attachment.displayName).trim().normalize("NFC").toLocaleLowerCase();
+  if (normalizedText === normalizedReference) return "";
+  const withoutTag = sourceText
+    .replace(/[\u200E\u200F]?\s*<(?:attached|attachment|anhang|datei|angehängt|angehaengt):\s*[^>\n]{1,255}>/iu, "")
+    .replace(/^[^\n]{1,255}?\s+\((?:file attached|datei angehängt|datei angehaengt|angehängt|attached)\)\s*/iu, "")
     .trim();
-  if (withoutTag !== message.text.trim()) return withoutTag;
-  if (message.kind === "media-omitted") return "";
-  return message.text;
+  const withoutControls = withoutTag.replace(/[\u200E\u200F]/gu, "").trim();
+  if (/^.{1,255}?\s*[•·]\s*\d+\s+(?:pages?|seiten?)$/iu.test(withoutControls)) return "";
+  if (withoutTag !== sourceText.trim()) return withoutTag;
+  if (message.kind === "media-omitted") return sourceText.split("\n").slice(1).join("\n").trim();
+  return sourceText;
 }
 
 function pseudonym(name: string, participants: string[]): string {
@@ -222,6 +473,7 @@ function pseudonym(name: string, participants: string[]): string {
 }
 
 function senderLabel(message: ChatMessage, theme: RenderTheme, participants: string[]): string {
+  if (!isFirstAttachmentGroupItem(message)) return "";
   if (!message.sender || message.sender === theme.selfName) return "";
   return theme.anonymize ? pseudonym(message.sender, participants) : message.sender;
 }
@@ -230,10 +482,15 @@ export class AssetMediaStore {
   private readonly assets = new Map<string, ArchiveAsset>();
   private readonly images = new Map<string, DrawableImage>();
   private readonly animatedImages = new Map<string, AnimatedImageEntry>();
+  private readonly contactCards = new Map<string, ContactCardInfo>();
   private readonly videos = new Map<string, VideoDecoderEntry>();
-  private readonly audios = new Map<string, PcmAudioClip>();
-  private readonly audioAccess = new Map<string, number>();
-  private audioAccessCounter = 0;
+  private readonly audioDecoders = new Map<string, AudioDecoderEntry>();
+  private readonly audioMetadata = new Map<string, AudioMediaInfo>();
+  private readonly audioLoading = new Map<string, Promise<AudioDecoderEntry | undefined>>();
+  private readonly audioMetadataLoading = new Map<string, Promise<AudioMediaInfo | undefined>>();
+  private readonly failedAudio = new Set<string>();
+  private readonly noAudioTrack = new Set<string>();
+  private readonly blobs = new Map<string, Promise<Blob>>();
   private readonly objectUrls = new Set<string>();
   private readonly failed = new Set<string>();
   private readonly loading = new Map<string, Promise<void>>();
@@ -263,10 +520,42 @@ export class AssetMediaStore {
     return this.animatedImages.has(path);
   }
 
-  getAudioClip(path: string): PcmAudioClip | undefined {
-    const clip = this.audios.get(path);
-    if (clip) this.audioAccess.set(path, ++this.audioAccessCounter);
-    return clip;
+  getAudioInfo(path: string): AudioMediaInfo | undefined {
+    const entry = this.audioDecoders.get(path) ?? this.audioMetadata.get(path);
+    return entry ? { duration: entry.duration, peaks: entry.peaks } : undefined;
+  }
+
+  getContactCard(path: string): ContactCardInfo | undefined {
+    return this.contactCards.get(path);
+  }
+
+  getPlaybackDuration(path: string): number | undefined {
+    const video = this.videos.get(path);
+    const audio = this.audioDecoders.get(path);
+    if (video) return combinedPlaybackDuration(video.duration, audio?.duration, audio?.startOffset);
+    return audio?.duration ?? this.audioMetadata.get(path)?.duration ?? this.animatedImages.get(path)?.totalDuration;
+  }
+
+  getAudioTiming(path: string): { duration: number; startOffset: number } | undefined {
+    const decoder = this.audioDecoders.get(path);
+    if (decoder) return { duration: decoder.duration, startOffset: decoder.startOffset };
+    const metadata = this.audioMetadata.get(path);
+    return metadata ? { duration: metadata.duration, startOffset: 0 } : undefined;
+  }
+
+  getKnownMediaDurations(): ReadonlyMap<string, number> {
+    const durations = new Map<string, number>();
+    for (const [path, entry] of this.animatedImages) durations.set(path, entry.totalDuration);
+    for (const [path, entry] of this.videos) durations.set(path, entry.duration);
+    for (const [path, entry] of this.audioMetadata) {
+      if (!durations.has(path)) durations.set(path, entry.duration);
+    }
+    for (const [path, entry] of this.audioDecoders) {
+      const videoDuration = this.videos.get(path)?.duration;
+      const duration = combinedPlaybackDuration(videoDuration, entry.duration, entry.startOffset);
+      if (duration !== undefined) durations.set(path, duration);
+    }
+    return durations;
   }
 
   getMediaDimensions(path: string): { width: number; height: number } | undefined {
@@ -286,25 +575,74 @@ export class AssetMediaStore {
     const result: ScheduledAudioAsset[] = [];
     for (const event of timeline.events) {
       const attachment = event.message.attachment;
-      if (attachment?.status !== "found" || attachment.kind !== "audio") continue;
-      result.push({ at: event.at, path: attachment.archivePath });
+      if (attachment?.status !== "found" || !["audio", "video"].includes(attachment.kind)) continue;
+      const timing = this.getAudioTiming(attachment.archivePath);
+      if (!timing || !Number.isFinite(timing.duration)) {
+        if (attachment.kind === "audio") {
+          // Keep an unreadable standalone audio attachment in the export plan.
+          // The required loader path then reports the error instead of silently
+          // producing a video without the requested recording.
+          result.push({
+            at: event.at,
+            path: attachment.archivePath,
+            duration: Math.max(0.01, event.mediaDuration ?? 0.01),
+            clipStart: 0,
+            required: true,
+          });
+        }
+        continue;
+      }
+      const clipStart = Math.max(0, -timing.startOffset);
+      const duration = Math.max(0, timing.duration - clipStart);
+      if (duration <= 0) continue;
+      result.push({
+        at: event.at + Math.max(0, timing.startOffset),
+        path: attachment.archivePath,
+        duration,
+        clipStart,
+        required: attachment.kind === "audio",
+      });
     }
     return result;
   }
 
-  async loadAudioClip(path: string): Promise<PcmAudioClip | undefined> {
-    await this.load(path);
-    return this.getAudioClip(path);
+  getMediaIssues(messages: ChatMessage[]): string[] {
+    const issues = new Set<string>();
+    for (const message of messages) {
+      const attachment = message.attachment;
+      if (attachment?.status !== "found") continue;
+      const label = attachment.displayName.replace(/[\u200E\u200F\u202A-\u202E\u2066-\u2069]/gu, "");
+      if (attachment.kind === "video" && !this.videos.has(attachment.archivePath)) {
+        issues.add(`Videospur „${label}“ kann nicht dekodiert werden.`);
+      } else if (attachment.kind === "video" && this.failedAudio.has(attachment.archivePath) && !this.noAudioTrack.has(attachment.archivePath)) {
+        issues.add(`Tonspur von „${label}“ kann nicht dekodiert werden.`);
+      } else if (attachment.kind === "audio" && (this.failedAudio.has(attachment.archivePath) || !this.audioMetadata.has(attachment.archivePath))) {
+        issues.add(`Audiodatei „${label}“ kann nicht dekodiert werden.`);
+      } else if (["image", "sticker"].includes(attachment.kind) && !this.images.has(attachment.archivePath) && !this.animatedImages.has(attachment.archivePath)) {
+        issues.add(`Bild „${label}“ kann nicht angezeigt werden.`);
+      }
+    }
+    return [...issues];
   }
 
   async preloadForMessages(messages: ChatMessage[], onProgress?: (done: number, total: number) => void): Promise<void> {
     const paths = [...new Set(messages
-      .filter((message) => message.attachment?.status === "found" && ["image", "sticker", "video"].includes(message.attachment.kind))
+      .filter((message) => message.attachment?.status === "found" && (
+        ["image", "sticker", "video", "audio"].includes(message.attachment.kind)
+        || (message.attachment.kind === "document" && /\.(?:vcf|vcard)$/iu.test(message.attachment.displayName))
+      ))
       .map((message) => message.attachment?.archivePath)
       .filter((path): path is string => Boolean(path)))];
     let done = 0;
     for (const path of paths) {
-      await this.load(path);
+      const asset = this.assets.get(path);
+      if (asset?.kind === "audio") await this.probeAudioMetadata(path);
+      else {
+        await this.load(path);
+        // Some .3gp/.mkv exports contain only an audio track. Probe it even if
+        // the visual track is absent or uses a codec the browser cannot decode.
+        if (asset?.kind === "video") await this.ensureAudioDecoder(path);
+      }
       done += 1;
       onProgress?.(done, paths.length);
     }
@@ -312,7 +650,9 @@ export class AssetMediaStore {
 
   async load(path: string): Promise<void> {
     if (this.disposed) return;
-    if (this.images.has(path) || this.animatedImages.has(path) || this.videos.has(path) || this.audios.has(path) || this.failed.has(path)) return;
+    const asset = this.assets.get(path);
+    if (asset?.kind === "audio" && this.failedAudio.has(path)) return;
+    if (this.images.has(path) || this.animatedImages.has(path) || this.contactCards.has(path) || this.videos.has(path) || this.audioDecoders.has(path) || this.failed.has(path)) return;
     const activeLoad = this.loading.get(path);
     if (activeLoad) {
       await activeLoad;
@@ -330,7 +670,7 @@ export class AssetMediaStore {
 
   private async loadAsset(path: string): Promise<void> {
     const asset = this.assets.get(path);
-    if (!asset || asset.size > 80 * 1024 * 1024 || /heic|heif/iu.test(asset.mimeType)) {
+    if (!asset || asset.size > MAX_DECODABLE_MEDIA_BYTES) {
       this.failed.add(path);
       return;
     }
@@ -340,11 +680,16 @@ export class AssetMediaStore {
         return;
       }
       if (asset.kind === "audio") {
-        await this.loadAudio(asset);
+        await this.ensureAudioDecoder(asset.path);
         return;
       }
-      const blob = await asset.loadBlob();
-      if (asset.mimeType === "image/gif" || /\.gif$/iu.test(asset.basename)) {
+      const blob = await this.getBlob(asset);
+      if (asset.kind === "document" && /\.(?:vcf|vcard)$/iu.test(asset.basename)) {
+        const card = parseVCard(await blob.text());
+        if (card) this.contactCards.set(asset.path, card);
+        return;
+      }
+      if (["image/gif", "image/webp"].includes(asset.mimeType) || /\.(?:gif|webp)$/iu.test(asset.basename)) {
         try {
           await this.loadAnimatedImage(asset, blob);
           return;
@@ -356,14 +701,28 @@ export class AssetMediaStore {
       await this.loadStaticImage(asset.path, blob);
     } catch {
       this.failed.add(path);
+    } finally {
+      // Decoded image objects and ImageDecoder own their data. Keep Blob
+      // caching only for audio/video where two track decoders may share it.
+      if (asset.kind === "image" || asset.kind === "sticker" || asset.kind === "document") this.blobs.delete(path);
     }
   }
 
   private async loadStaticImage(path: string, blob: Blob): Promise<void> {
     if (typeof createImageBitmap === "function") {
-      const bitmap = await createImageBitmap(blob, { imageOrientation: "from-image" });
-      this.images.set(path, bitmap);
-      return;
+      try {
+        const bitmap = await createImageBitmap(blob, { imageOrientation: "from-image" });
+        try {
+          assertSafeMediaDimensions(bitmap.width, bitmap.height);
+        } catch (error) {
+          bitmap.close();
+          throw error;
+        }
+        this.images.set(path, bitmap);
+        return;
+      } catch {
+        // Some formats are supported by <img> even when createImageBitmap rejects them.
+      }
     }
     await this.loadHtmlImage(path, blob);
   }
@@ -377,6 +736,7 @@ export class AssetMediaStore {
         image.onerror = () => reject(new Error("Bild konnte nicht geladen werden"));
         image.src = url;
       });
+      assertSafeMediaDimensions(image.naturalWidth, image.naturalHeight);
       this.objectUrls.add(url);
       this.images.set(path, image);
     } catch (error) {
@@ -389,6 +749,12 @@ export class AssetMediaStore {
     if (typeof createImageBitmap === "function") {
       try {
         const bitmap = await createImageBitmap(blob);
+        try {
+          assertSafeMediaDimensions(bitmap.width, bitmap.height);
+        } catch (error) {
+          bitmap.close();
+          throw error;
+        }
         this.images.set(path, bitmap);
         return;
       } catch {
@@ -404,6 +770,7 @@ export class AssetMediaStore {
         image.onerror = () => reject(new Error("GIF konnte nicht geladen werden"));
         image.src = url;
       });
+      assertSafeMediaDimensions(image.naturalWidth, image.naturalHeight);
       const canvas = document.createElement("canvas");
       canvas.width = image.naturalWidth;
       canvas.height = image.naturalHeight;
@@ -417,35 +784,48 @@ export class AssetMediaStore {
   }
 
   private async loadAnimatedImage(asset: ArchiveAsset, blob: Blob): Promise<void> {
-    if (typeof ImageDecoder === "undefined" || !await ImageDecoder.isTypeSupported("image/gif")) {
-      throw new Error("Animierte GIFs werden von diesem Browser nicht dekodiert");
+    const type = asset.mimeType === "image/webp" || /\.webp$/iu.test(asset.basename) ? "image/webp" : "image/gif";
+    if (typeof ImageDecoder === "undefined" || !await ImageDecoder.isTypeSupported(type)) {
+      throw new Error("Animierte Bilder werden von diesem Browser nicht dekodiert");
     }
     const decoder = new ImageDecoder({
       data: await blob.arrayBuffer(),
-      type: "image/gif",
+      type,
       preferAnimation: true,
     });
+    let firstFrame: VideoFrame | null = null;
     try {
       await decoder.tracks.ready;
       const track = decoder.tracks.selectedTrack;
       if (!track || track.frameCount < 1) throw new Error("GIF enthält keine Frames");
+      if (type === "image/webp" && track.frameCount < 2) throw new Error("WebP ist nicht animiert");
+      if (!isSafeAnimatedImageCycle(track.frameCount, 0, 0)) {
+        throw new Error("Animation überschreitet die sichere Frame-Grenze");
+      }
       const frameDurations: number[] = [];
       let totalDuration = 0;
-      let firstFrame: VideoFrame | null = null;
-      const frameLimit = Math.min(track.frameCount, 1_200);
-      for (let frameIndex = 0; frameIndex < frameLimit && totalDuration < MEDIA_PREVIEW_SECONDS; frameIndex += 1) {
+      let decodedPixels = 0;
+      for (let frameIndex = 0; frameIndex < track.frameCount; frameIndex += 1) {
+        const result = await decoder.decode({ frameIndex, completeFramesOnly: true });
         try {
-          const result = await decoder.decode({ frameIndex, completeFramesOnly: true });
+          assertSafeMediaDimensions(result.image.displayWidth, result.image.displayHeight);
           const duration = Math.max(0.02, (result.image.duration ?? 100_000) / 1_000_000);
+          const nextDuration = totalDuration + duration;
+          const nextDecodedPixels = decodedPixels + result.image.displayWidth * result.image.displayHeight;
+          if (!isSafeAnimatedImageCycle(track.frameCount, nextDecodedPixels, nextDuration)) {
+            throw new Error("Animation überschreitet die sichere Dekodiergrenze");
+          }
           frameDurations.push(duration);
-          totalDuration += duration;
+          totalDuration = nextDuration;
+          decodedPixels = nextDecodedPixels;
           if (!firstFrame) firstFrame = result.image;
           else result.image.close();
-        } catch {
-          break;
+        } catch (error) {
+          if (result.image !== firstFrame) result.image.close();
+          throw error;
         }
       }
-      if (!firstFrame || !frameDurations.length) throw new Error("GIF konnte nicht dekodiert werden");
+      if (!firstFrame || frameDurations.length !== track.frameCount) throw new Error("GIF konnte nicht vollständig dekodiert werden");
       this.animatedImages.set(asset.path, {
         decoder,
         width: firstFrame.displayWidth,
@@ -456,72 +836,169 @@ export class AssetMediaStore {
         frameIndex: 0,
         pending: null,
       });
+      firstFrame = null;
     } catch (error) {
+      firstFrame?.close();
       decoder.close();
       throw error;
     }
   }
 
-  private async loadAudio(asset: ArchiveAsset): Promise<void> {
+  private async getBlob(asset: ArchiveAsset): Promise<Blob> {
+    const cached = this.blobs.get(asset.path);
+    if (cached) return cached;
+    const pending = asset.loadBlob().catch((error) => {
+      this.blobs.delete(asset.path);
+      throw error;
+    });
+    this.blobs.set(asset.path, pending);
+    return pending;
+  }
+
+  private async probeAudioMetadata(path: string): Promise<AudioMediaInfo | undefined> {
+    const cached = this.audioMetadata.get(path) ?? this.audioDecoders.get(path);
+    if (cached) return { duration: cached.duration, peaks: cached.peaks };
+    if (this.failedAudio.has(path) || this.noAudioTrack.has(path) || this.disposed) return undefined;
+    const active = this.audioMetadataLoading.get(path);
+    if (active) return active;
+    const asset = this.assets.get(path);
+    if (!asset || asset.kind !== "audio" || asset.size > MAX_DECODABLE_MEDIA_BYTES) return undefined;
+    const pending = (async (): Promise<AudioMediaInfo | undefined> => {
+      let input: Input<BlobSource> | null = null;
+      try {
+        input = new Input({ source: new BlobSource(await asset.loadBlob()), formats: ALL_FORMATS });
+        if (!await input.canRead()) throw new Error("Audioformat nicht lesbar");
+        const track = await input.getPrimaryAudioTrack();
+        if (!track) throw new Error("Keine Audiospur gefunden");
+        const canDecode = await track.canDecode();
+        const firstTimestamp = Math.max(0, await track.getFirstTimestamp());
+        let endTimestamp = await track.getDurationFromMetadata();
+        try { endTimestamp = await track.computeDuration(); } catch { /* Use container metadata as fallback. */ }
+        if (endTimestamp === null) throw new Error("Audiodauer konnte nicht bestimmt werden");
+        const metadata = { duration: Math.max(0.01, endTimestamp - firstTimestamp), peaks: placeholderWaveformPeaks() };
+        if (this.disposed) return undefined;
+        this.audioMetadata.set(path, metadata);
+        if (!canDecode) this.failedAudio.add(path);
+        return metadata;
+      } catch {
+        this.failedAudio.add(path);
+        return undefined;
+      } finally {
+        input?.dispose();
+      }
+    })().finally(() => this.audioMetadataLoading.delete(path));
+    this.audioMetadataLoading.set(path, pending);
+    return pending;
+  }
+
+  private async ensureAudioDecoder(path: string): Promise<AudioDecoderEntry | undefined> {
+    const cached = this.audioDecoders.get(path);
+    if (cached) return cached;
+    if (this.failedAudio.has(path) || this.noAudioTrack.has(path) || this.disposed) return undefined;
+    const active = this.audioLoading.get(path);
+    if (active) return active;
+    const asset = this.assets.get(path);
+    if (!asset || !["audio", "video"].includes(asset.kind) || asset.size > MAX_DECODABLE_MEDIA_BYTES) {
+      this.failedAudio.add(path);
+      return undefined;
+    }
+    const pending = this.createAudioDecoder(asset)
+      .catch(() => {
+        if (!this.noAudioTrack.has(path)) this.failedAudio.add(path);
+        return undefined;
+      })
+      .finally(() => this.audioLoading.delete(path));
+    this.audioLoading.set(path, pending);
+    return pending;
+  }
+
+  private async createAudioDecoder(asset: ArchiveAsset): Promise<AudioDecoderEntry> {
     let input: Input<BlobSource> | null = null;
     try {
-      const blob = await asset.loadBlob();
+      const blob = await this.getBlob(asset);
       input = new Input({ source: new BlobSource(blob), formats: ALL_FORMATS });
       if (!await input.canRead()) throw new Error("Audioformat nicht lesbar");
       const track = await input.getPrimaryAudioTrack();
-      if (!track) throw new Error("Keine Audiospur gefunden");
+      if (!track) {
+        this.noAudioTrack.add(asset.path);
+        throw new Error("Keine Audiospur gefunden");
+      }
       if (!await track.canDecode()) throw new Error("Audiocodec wird von diesem Browser nicht unterstützt");
-      const firstTimestamp = await track.getFirstTimestamp();
-      const endTimestamp = await track.getDurationFromMetadata() ?? await track.computeDuration();
-      const expectedDuration = Math.min(MEDIA_PREVIEW_SECONDS, Math.max(0.01, endTimestamp - firstTimestamp));
-      const capacity = Math.max(1, Math.ceil(expectedDuration * AUDIO_SAMPLE_RATE));
-      const left = new Float32Array(new ArrayBuffer(capacity * Float32Array.BYTES_PER_ELEMENT));
-      const right = new Float32Array(new ArrayBuffer(capacity * Float32Array.BYTES_PER_ELEMENT));
-      const sink = new AudioBufferSink(track);
-      let decodedEnd = 0;
-      for await (const wrapped of sink.buffers(firstTimestamp, firstTimestamp + expectedDuration)) {
-        const localStart = wrapped.timestamp - firstTimestamp;
-        mixAudioBuffer(left, right, wrapped.buffer, localStart);
-        decodedEnd = Math.max(decodedEnd, Math.min(expectedDuration, localStart + wrapped.duration));
-      }
-      if (decodedEnd <= 0) throw new Error("Audiodatei enthält keine dekodierbaren Samples");
-      const duration = Math.min(expectedDuration, decodedEnd);
-      const length = Math.max(1, Math.ceil(duration * AUDIO_SAMPLE_RATE));
-      const trimmedLeft = left.slice(0, length) as Float32Array<ArrayBuffer>;
-      const trimmedRight = right.slice(0, length) as Float32Array<ArrayBuffer>;
-      this.audios.set(asset.path, {
+      const firstTimestamp = Math.max(0, await track.getFirstTimestamp());
+      let endTimestamp = await track.getDurationFromMetadata();
+      try { endTimestamp = await track.computeDuration(); } catch { /* Use container metadata as fallback. */ }
+      if (endTimestamp === null) throw new Error("Audiodauer konnte nicht bestimmt werden");
+      const duration = Math.max(0.01, endTimestamp - firstTimestamp);
+      const videoFirstTimestamp = this.videos.get(asset.path)?.firstTimestamp;
+      const startOffset = videoFirstTimestamp === undefined ? 0 : firstTimestamp - videoFirstTimestamp;
+      if (this.disposed) throw new Error("Medienspeicher wurde geschlossen");
+      const entry: AudioDecoderEntry = {
+        input,
+        sink: new AudioBufferSink(track),
+        firstTimestamp,
+        startOffset,
         duration,
-        sampleRate: AUDIO_SAMPLE_RATE,
-        left: trimmedLeft,
-        right: trimmedRight,
-        peaks: waveformPeaks(trimmedLeft, trimmedRight),
-      });
-      this.audioAccess.set(asset.path, ++this.audioAccessCounter);
-      while (this.audios.size > MAX_CACHED_AUDIO_CLIPS) {
-        const oldest = [...this.audioAccess.entries()]
-          .filter(([path]) => path !== asset.path)
-          .sort((a, b) => a[1] - b[1])[0]?.[0];
-        if (!oldest) break;
-        this.audios.delete(oldest);
-        this.audioAccess.delete(oldest);
-      }
+        peaks: this.audioMetadata.get(asset.path)?.peaks ?? placeholderWaveformPeaks(),
+      };
+      this.audioDecoders.set(asset.path, entry);
+      this.audioMetadata.set(asset.path, { duration: entry.duration, peaks: entry.peaks });
+      this.failedAudio.delete(asset.path);
+      this.noAudioTrack.delete(asset.path);
+      input = null;
+      return entry;
     } finally {
       input?.dispose();
     }
   }
 
+  async loadAudioSegment(path: string, start: number, requestedDuration = AUDIO_SEGMENT_SECONDS): Promise<PcmAudioClip | undefined> {
+    const entry = await this.ensureAudioDecoder(path);
+    if (!entry || this.disposed) return undefined;
+    const localStart = Math.max(0, Math.min(entry.duration, start));
+    const duration = Math.max(0, Math.min(requestedDuration, entry.duration - localStart));
+    if (duration <= 0) return undefined;
+    const capacity = Math.max(1, Math.ceil(duration * AUDIO_SAMPLE_RATE));
+    const left = new Float32Array(new ArrayBuffer(capacity * Float32Array.BYTES_PER_ELEMENT));
+    const right = new Float32Array(new ArrayBuffer(capacity * Float32Array.BYTES_PER_ELEMENT));
+    let decodedEnd = 0;
+    const absoluteStart = entry.firstTimestamp + localStart;
+    const absoluteEnd = absoluteStart + duration;
+    for await (const wrapped of entry.sink.buffers(absoluteStart, absoluteEnd)) {
+      if (this.disposed) return undefined;
+      const bufferStart = wrapped.timestamp - absoluteStart;
+      mixAudioBuffer(left, right, wrapped.buffer, bufferStart);
+      decodedEnd = Math.max(decodedEnd, Math.min(duration, bufferStart + wrapped.duration));
+    }
+    if (decodedEnd <= 0) throw new Error("Audiodatei enthält keine dekodierbaren Samples");
+    if (decodedEnd + 0.08 < duration) {
+      throw new Error("Audiodatei konnte nicht bis zum Ende des Segments dekodiert werden");
+    }
+    const peaks = waveformPeaks(left, right);
+    return {
+      duration,
+      sampleRate: AUDIO_SAMPLE_RATE,
+      left,
+      right,
+      peaks,
+    };
+  }
+
   private async loadVideo(asset: ArchiveAsset): Promise<void> {
     let input: Input<BlobSource> | null = null;
     try {
-      const blob = await asset.loadBlob();
+      const blob = await this.getBlob(asset);
       input = new Input({ source: new BlobSource(blob), formats: ALL_FORMATS });
       if (!await input.canRead()) throw new Error("Videoformat nicht lesbar");
       const track = await input.getPrimaryVideoTrack();
       if (!track) throw new Error("Keine Videospur gefunden");
       if (!await track.canDecode()) throw new Error("Videocodec wird von diesem Browser nicht unterstützt");
-      const firstTimestamp = await track.getFirstTimestamp();
-      const endTimestamp = await track.getDurationFromMetadata() ?? await track.computeDuration();
+      const firstTimestamp = Math.max(0, await track.getFirstTimestamp());
+      let endTimestamp = await track.getDurationFromMetadata();
+      try { endTimestamp = await track.computeDuration(); } catch { /* Use container metadata as fallback. */ }
+      if (endTimestamp === null) throw new Error("Videodauer konnte nicht bestimmt werden");
       const [width, height] = await Promise.all([track.getDisplayWidth(), track.getDisplayHeight()]);
+      assertSafeMediaDimensions(width, height);
+      if (this.disposed) throw new Error("Medienspeicher wurde geschlossen");
       const entry: VideoDecoderEntry = {
         input,
         sink: new VideoSampleSink(track),
@@ -540,6 +1017,7 @@ export class AssetMediaStore {
       this.videos.set(asset.path, entry);
       await this.prepareVideoFrame(asset.path, 0, true);
     } catch (error) {
+      this.videos.delete(asset.path);
       input?.dispose();
       this.failed.add(asset.path);
       throw error;
@@ -564,7 +1042,7 @@ export class AssetMediaStore {
           entry.exportFallback = true;
           try { await entry.exportIterator.return(); } catch { /* Keep the last decoded frame. */ }
           entry.exportIterator = null;
-          return;
+          throw new Error(`Video „${this.assets.get(path)?.basename ?? path}“ konnte nicht vollständig dekodiert werden.`);
         }
         entry.exportCursor += 1;
         if (!result.value) continue;
@@ -596,6 +1074,7 @@ export class AssetMediaStore {
       })
       .catch(() => {
         this.failed.add(path);
+        if (exact) throw new Error(`Video „${this.assets.get(path)?.basename ?? path}“ konnte nicht dekodiert werden.`);
       })
       .finally(() => {
         entry.pending = null;
@@ -620,6 +1099,12 @@ export class AssetMediaStore {
           result.image.close();
           return;
         }
+        try {
+          assertSafeMediaDimensions(result.image.displayWidth, result.image.displayHeight);
+        } catch (error) {
+          result.image.close();
+          throw error;
+        }
         entry.frame?.close();
         entry.frame = result.image;
         entry.frameIndex = nextIndex;
@@ -640,7 +1125,7 @@ export class AssetMediaStore {
       const entry = this.videos.get(attachment.archivePath);
       if (!entry) continue;
       const items = byPath.get(attachment.archivePath) ?? [];
-      items.push({ eventAt: event.at, duration: Math.min(MEDIA_PREVIEW_SECONDS, entry.duration) });
+      items.push({ eventAt: event.at, duration: Math.min(event.mediaDuration ?? entry.duration, entry.duration) });
       byPath.set(attachment.archivePath, items);
     }
     for (const [path, events] of byPath) {
@@ -689,12 +1174,19 @@ export class AssetMediaStore {
       animated.frame?.close();
       animated.decoder.close();
     }
+    for (const audio of this.audioDecoders.values()) audio.input.dispose();
     for (const url of this.objectUrls) URL.revokeObjectURL(url);
     this.images.clear();
     this.animatedImages.clear();
+    this.contactCards.clear();
     this.videos.clear();
-    this.audios.clear();
-    this.audioAccess.clear();
+    this.audioDecoders.clear();
+    this.audioMetadata.clear();
+    this.audioLoading.clear();
+    this.audioMetadataLoading.clear();
+    this.failedAudio.clear();
+    this.noAudioTrack.clear();
+    this.blobs.clear();
     this.objectUrls.clear();
   }
 
@@ -710,6 +1202,7 @@ export class ChatCanvasRenderer {
   private currentTimeline: CompiledTimeline = { events: [], duration: 0 };
   private currentTime = 0;
   private eventTimes = new Map<string, number>();
+  private eventDurations = new Map<string, number>();
 
   constructor(private readonly canvas: HTMLCanvasElement, private readonly media: AssetMediaStore) {
     const context = canvas.getContext("2d", { alpha: false });
@@ -725,6 +1218,9 @@ export class ChatCanvasRenderer {
     if (this.currentTimeline !== timeline) {
       this.currentTimeline = timeline;
       this.eventTimes = new Map(timeline.events.map((event) => [event.message.id, event.at]));
+      this.eventDurations = new Map(timeline.events
+        .filter((event) => Boolean(event.mediaDuration))
+        .map((event) => [event.message.id, event.mediaDuration ?? 0]));
     }
     this.currentTime = time;
     const ctx = this.ctx;
@@ -759,15 +1255,19 @@ export class ChatCanvasRenderer {
       const attachment = event.message.attachment;
       if (attachment?.status !== "found") continue;
       if (attachment.kind === "video") {
-        const duration = Math.min(MEDIA_PREVIEW_SECONDS, this.media.getVideoDuration(attachment.archivePath) ?? MEDIA_PREVIEW_SECONDS);
+        const duration = Math.min(
+          event.mediaDuration ?? this.media.getVideoDuration(attachment.archivePath) ?? 0,
+          this.media.getVideoDuration(attachment.archivePath) ?? event.mediaDuration ?? 0,
+        );
         const elapsed = clamp(time - event.at, 0, Math.max(0, duration - 0.001));
         const active = time - event.at <= duration + 0.25;
         if (active || !this.media.getVideoFrame(attachment.archivePath)) {
           promises.push(this.media.prepareVideoFrame(attachment.archivePath, elapsed, exact));
         }
       } else if (this.media.isAnimatedImage(attachment.archivePath)) {
-        const elapsed = clamp(time - event.at, 0, MEDIA_PREVIEW_SECONDS - 0.001);
-        if (time - event.at <= MEDIA_PREVIEW_SECONDS + 0.25 || !this.media.getAnimatedFrame(attachment.archivePath)) {
+        const cycleDuration = this.media.getPlaybackDuration(attachment.archivePath) ?? event.mediaDuration ?? 0;
+        const elapsed = clamp(time - event.at, 0, Math.max(0, cycleDuration - 0.001));
+        if (time - event.at <= cycleDuration + 0.25 || !this.media.getAnimatedFrame(attachment.archivePath)) {
           promises.push(this.media.prepareAnimatedFrame(attachment.archivePath, elapsed, exact));
         }
       }
@@ -880,7 +1380,7 @@ export class ChatCanvasRenderer {
         }
         if (ctx.measureText(line).width > maxWidth) {
           let chunk = "";
-          for (const character of [...line]) {
+          for (const character of graphemes(line)) {
             if (ctx.measureText(chunk + character).width > maxWidth && chunk) {
               result.push(chunk);
               chunk = character;
@@ -891,46 +1391,92 @@ export class ChatCanvasRenderer {
       }
       result.push(line.trimEnd());
     }
-    return result.slice(0, 36);
+    return result;
   }
 
   private layoutMessage(message: ChatMessage, theme: RenderTheme, scale: number, previous?: ChatMessage): BubbleLayout {
     const ctx = this.ctx;
     const maxWidth = 760 * scale;
     const font = `400 ${30 * scale}px system-ui, -apple-system, "Segoe UI Emoji", sans-serif`;
-    const caption = cleanMediaCaption(message);
+    const card = messageCardPresentation(message);
+    const firstGroupItem = isFirstAttachmentGroupItem(message);
+    const showTimestamp = shouldShowMessageTimestamp(message);
+    const caption = firstGroupItem ? (card ? card.body ?? "" : cleanMediaCaption(message)) : "";
     const lines = this.wrapText(caption, maxWidth - 54 * scale, font);
+    const quoteLines = this.wrapText(firstGroupItem ? message.quotedText ?? "" : "", maxWidth - 92 * scale, `400 ${24 * scale}px system-ui, -apple-system, "Segoe UI Emoji", sans-serif`);
     const label = senderLabel(message, theme, this.participants);
     ctx.font = font;
     const textWidth = Math.max(0, ...lines.map((line) => ctx.measureText(line || " ").width));
     ctx.font = `500 ${23 * scale}px system-ui, -apple-system, sans-serif`;
     const senderWidth = label ? ctx.measureText(label).width : 0;
-    const hasVisual = message.attachment?.status === "found" && ["image", "sticker", "video"].includes(message.attachment.kind);
+    const visualDimensions = message.attachment?.status === "found"
+      ? this.media.getMediaDimensions(message.attachment.archivePath)
+      : undefined;
+    const hasVisual = Boolean(visualDimensions) && ["image", "sticker", "video"].includes(message.attachment?.kind ?? "");
     const hasAttachment = Boolean(message.attachment);
     let mediaWidth = 0;
     let mediaHeight = 0;
+    if (!hasVisual && hasAttachment) {
+      mediaWidth = 582 * scale;
+      mediaHeight = /\.(?:vcf|vcard)$/iu.test(message.attachment?.displayName ?? "") ? 132 * scale : 92 * scale;
+    }
+    const cardWidth = card ? 620 * scale : 0;
+    const cardDetailLines = card
+      ? this.wrapText(card.detail ?? "", cardWidth - 112 * scale, `400 ${22 * scale}px system-ui, -apple-system, "Segoe UI Emoji", sans-serif`)
+      : [];
+    const cardItemLines = card
+      ? card.items.map((item) => this.wrapText(item, cardWidth - 80 * scale, `400 ${23 * scale}px system-ui, -apple-system, "Segoe UI Emoji", sans-serif`))
+      : [];
+    const cardItemHeights = cardItemLines.map((itemLines) => Math.max(42 * scale, itemLines.length * 28 * scale + 14 * scale));
+    const cardHeaderHeight = card ? Math.max(74 * scale, 56 * scale + cardDetailLines.length * 27 * scale) : 0;
+    const cardHeight = card ? cardHeaderHeight + cardItemHeights.reduce((sum, itemHeight) => sum + itemHeight + 8 * scale, 0) + 16 * scale : 0;
+    const senderHeight = label ? 34 * scale : 0;
+    const forwardedHeight = forwardedPresentationLabel(message) ? 29 * scale : 0;
+    const quoteHeight = quoteLines.length ? quoteLines.length * 31 * scale + 26 * scale : 0;
+    const textHeight = lines.length ? lines.length * 39 * scale + 8 * scale : 0;
+    const cardSpacing = cardHeight ? 12 * scale : 0;
+    const quoteSpacing = quoteHeight ? 10 * scale : 0;
+    const footerHeight = showTimestamp ? 35 * scale : 4 * scale;
     if (hasVisual && message.attachment) {
-      const dimensions = this.media.getMediaDimensions(message.attachment.archivePath) ?? { width: 16, height: 9 };
-      const fitted = fitMediaBox(dimensions.width, dimensions.height, 690 * scale, 610 * scale);
+      const dimensions = visualDimensions ?? { width: 16, height: 9 };
+      const chatViewportHeight = Math.max(280 * scale, this.canvas.height - 298 * scale);
+      const nonMediaHeight = 28 * scale + senderHeight + forwardedHeight + quoteHeight + quoteSpacing
+        + cardHeight + cardSpacing + textHeight + footerHeight + 12 * scale;
+      const maxVisualHeight = Math.max(120 * scale, Math.min(610 * scale, chatViewportHeight - nonMediaHeight));
+      const roleMaxWidth = message.mediaRole === "sticker" ? 330 * scale : message.mediaRole === "video-note" ? 430 * scale : 690 * scale;
+      const roleMaxHeight = message.mediaRole === "sticker" ? Math.min(maxVisualHeight, 330 * scale) : maxVisualHeight;
+      const fitted = fitMediaBox(dimensions.width, dimensions.height, roleMaxWidth, roleMaxHeight);
       mediaWidth = fitted.width;
       mediaHeight = fitted.height;
-    } else if (hasAttachment) {
-      mediaWidth = 582 * scale;
-      mediaHeight = 92 * scale;
     }
     const baseWidth = Math.max(
       190 * scale,
       mediaWidth ? mediaWidth + 28 * scale : 0,
+      cardWidth ? cardWidth + 28 * scale : 0,
       textWidth + 58 * scale,
       senderWidth + 58 * scale,
     );
     const width = Math.min(maxWidth, baseWidth);
-    const senderHeight = label ? 34 * scale : 0;
-    const textHeight = lines.length ? lines.length * 39 * scale + 8 * scale : 0;
     const mediaSpacing = mediaHeight ? 12 * scale : 0;
-    const height = 28 * scale + senderHeight + mediaHeight + mediaSpacing + textHeight + 35 * scale;
+    const height = 28 * scale + senderHeight + forwardedHeight + quoteHeight + quoteSpacing + cardHeight + cardSpacing + mediaHeight + mediaSpacing + textHeight + footerHeight;
     const dateLabel = !previous || dayKey(previous.timestamp) !== dayKey(message.timestamp) ? formatDay(message.timestamp) : undefined;
-    return { message, lines, senderLabel: label, width, height, mediaWidth, mediaHeight, dateLabel };
+    return {
+      message,
+      lines,
+      quoteLines,
+      senderLabel: label,
+      width,
+      height,
+      mediaWidth,
+      mediaHeight,
+      card,
+      cardDetailLines,
+      cardItemLines,
+      cardItemHeights,
+      cardWidth,
+      cardHeight,
+      dateLabel,
+    };
   }
 
   private drawMessages(timeline: CompiledTimeline, time: number, theme: RenderTheme, palette: Palette, bottom: number, scale: number): void {
@@ -944,12 +1490,29 @@ export class ChatCanvasRenderer {
       scale,
       timeline.events[start + index - 1]?.message,
     ));
-    const gap = 15 * scale;
+    const gaps = layouts.map((layout, index) => messageGapAfter(
+      layout.message,
+      timeline.events[start + index + 1]?.message,
+      scale,
+    ));
     const dateHeight = 66 * scale;
-    const total = layouts.reduce((sum, layout) => sum + layout.height + gap + (layout.dateLabel ? dateHeight : 0), 0);
+    const total = layouts.reduce((sum, layout, index) => sum + layout.height + (gaps[index] ?? 15 * scale) + (layout.dateLabel ? dateHeight : 0), 0);
     // Anchor the newest message above the composer. When the chat is taller than
     // the viewport, older bubbles deliberately move above the clipping region.
     let y = bottom - 24 * scale - total;
+    const latestLayout = layouts[layouts.length - 1];
+    const latestEvent = events[events.length - 1];
+    if (latestLayout && latestEvent) {
+      const latestEntryHeight = latestLayout.height + (gaps[gaps.length - 1] ?? 15 * scale) + (latestLayout.dateLabel ? dateHeight : 0);
+      const availableHeight = Math.max(120 * scale, bottom - 132 * scale - 48 * scale);
+      const nextEventAt = timeline.events[visibleCount]?.at ?? timeline.duration;
+      y += oversizedBubbleScrollOffset(
+        latestEntryHeight,
+        availableHeight,
+        time - latestEvent.at,
+        nextEventAt - latestEvent.at,
+      );
+    }
     const w = this.canvas.width;
 
     layouts.forEach((layout, index) => {
@@ -973,7 +1536,7 @@ export class ChatCanvasRenderer {
       this.ctx.globalAlpha = progress;
       this.drawBubble(layout, theme, palette, translatedY, scale);
       this.ctx.restore();
-      y += layout.height + gap;
+      y += layout.height + (gaps[index] ?? 15 * scale);
     });
   }
 
@@ -981,20 +1544,24 @@ export class ChatCanvasRenderer {
     const ctx = this.ctx;
     const w = this.canvas.width;
     const isSystem = !layout.message.sender;
-    if (isSystem) {
-      const width = Math.min(720 * scale, layout.width);
-      const x = (w - width) / 2;
-      roundedRect(ctx, x, y, width, layout.height, 18 * scale);
-      ctx.fillStyle = palette.system;
-      ctx.fill();
-      this.drawTextLines(layout.lines, x + 27 * scale, y + 25 * scale, width - 54 * scale, palette, scale, true);
-      return;
-    }
     const mine = layout.message.sender === theme.selfName;
-    const x = mine ? w - 34 * scale - layout.width : 34 * scale;
-    roundedRect(ctx, x, y, layout.width, layout.height, 20 * scale);
-    ctx.fillStyle = mine ? palette.outgoing : palette.incoming;
-    ctx.fill();
+    const width = isSystem ? Math.min(720 * scale, layout.width) : layout.width;
+    const x = isSystem ? (w - width) / 2 : mine ? w - 34 * scale - width : 34 * scale;
+    const stickerPath = layout.message.attachment?.archivePath;
+    const transparentSticker = layout.message.mediaRole === "sticker"
+      && layout.message.attachment?.status === "found"
+      && Boolean(stickerPath && this.media.getMediaDimensions(stickerPath));
+    const bareSticker = transparentSticker
+      && layout.mediaHeight > 0
+      && !layout.card
+      && !layout.lines.length
+      && !layout.quoteLines.length
+      && !forwardedPresentationLabel(layout.message);
+    if (!bareSticker) {
+      roundedRect(ctx, x, y, width, layout.height, 20 * scale);
+      ctx.fillStyle = isSystem ? palette.system : mine ? palette.outgoing : palette.incoming;
+      ctx.fill();
+    }
     let cursorY = y + 23 * scale;
     if (layout.senderLabel) {
       ctx.fillStyle = palette.accent;
@@ -1004,18 +1571,123 @@ export class ChatCanvasRenderer {
       ctx.fillText(layout.senderLabel, x + 27 * scale, cursorY);
       cursorY += 34 * scale;
     }
+    const forwardedLabel = forwardedPresentationLabel(layout.message);
+    if (forwardedLabel) {
+      ctx.fillStyle = palette.mutedText;
+      ctx.font = `500 ${20 * scale}px system-ui, -apple-system, sans-serif`;
+      ctx.textAlign = "left";
+      ctx.textBaseline = "top";
+      ctx.fillText(forwardedLabel, x + 27 * scale, cursorY);
+      cursorY += 29 * scale;
+    }
+    if (layout.quoteLines.length) {
+      const quoteHeight = layout.quoteLines.length * 31 * scale + 26 * scale;
+      this.drawQuoteBlock(layout.quoteLines, x + 18 * scale, cursorY, width - 36 * scale, quoteHeight, palette, scale);
+      cursorY += quoteHeight + 10 * scale;
+    }
+    if (layout.card && layout.cardHeight > 0) {
+      const cardX = x + (width - layout.cardWidth) / 2;
+      this.drawSpecialCard(layout, cardX, cursorY, layout.cardWidth, layout.cardHeight, palette, scale);
+      cursorY += layout.cardHeight + 12 * scale;
+    }
     if (layout.mediaHeight > 0) {
-      const mediaX = x + (layout.width - layout.mediaWidth) / 2;
+      const mediaX = x + (width - layout.mediaWidth) / 2;
       this.drawMedia(layout, mediaX, cursorY, layout.mediaWidth, layout.mediaHeight, palette, scale);
       cursorY += layout.mediaHeight + 12 * scale;
     }
-    if (layout.lines.length) this.drawTextLines(layout.lines, x + 27 * scale, cursorY, layout.width - 54 * scale, palette, scale, false);
-    ctx.fillStyle = palette.mutedText;
+    if (layout.lines.length) this.drawTextLines(layout.lines, x + 27 * scale, cursorY, width - 54 * scale, palette, scale, isSystem && !layout.card);
+    if (isSystem || !shouldShowMessageTimestamp(layout.message)) return;
+    const timeLabel = `${layout.message.edited ? "BEARBEITET · " : ""}${formatTime(layout.message.timestamp)}`;
+    if (bareSticker) {
+      ctx.font = `500 ${19 * scale}px system-ui, -apple-system, sans-serif`;
+      const chipWidth = ctx.measureText(timeLabel).width + 20 * scale;
+      roundedRect(ctx, x + width - chipWidth - 10 * scale, y + layout.height - 37 * scale, chipWidth, 28 * scale, 9 * scale);
+      ctx.fillStyle = "rgba(0, 0, 0, .55)";
+      ctx.fill();
+    }
+    ctx.fillStyle = bareSticker ? "#ffffff" : palette.mutedText;
     ctx.font = `400 ${19 * scale}px system-ui, -apple-system, sans-serif`;
     ctx.textAlign = "right";
     ctx.textBaseline = "bottom";
-    const check = mine ? "  ✓✓" : "";
-    ctx.fillText(`${formatTime(layout.message.timestamp)}${check}`, x + layout.width - 20 * scale, y + layout.height - 12 * scale);
+    ctx.fillText(timeLabel, x + width - 20 * scale, y + layout.height - 12 * scale);
+  }
+
+  private drawQuoteBlock(
+    lines: string[],
+    x: number,
+    y: number,
+    width: number,
+    height: number,
+    palette: Palette,
+    scale: number,
+  ): void {
+    const ctx = this.ctx;
+    roundedRect(ctx, x, y, width, height, 12 * scale);
+    ctx.fillStyle = palette.media;
+    ctx.fill();
+    ctx.fillStyle = palette.accent;
+    ctx.fillRect(x, y, 6 * scale, height);
+    ctx.fillStyle = palette.mutedText;
+    ctx.font = `500 ${18 * scale}px system-ui, -apple-system, sans-serif`;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+    ctx.fillText("ZITAT", x + 20 * scale, y + 9 * scale);
+    ctx.fillStyle = palette.text;
+    ctx.font = `400 ${24 * scale}px system-ui, -apple-system, "Segoe UI Emoji", sans-serif`;
+    lines.forEach((line, index) => ctx.fillText(line, x + 20 * scale, y + 34 * scale + index * 31 * scale));
+  }
+
+  private drawSpecialCard(
+    layout: BubbleLayout,
+    x: number,
+    y: number,
+    width: number,
+    height: number,
+    palette: Palette,
+    scale: number,
+  ): void {
+    const card = layout.card;
+    if (!card) return;
+    const ctx = this.ctx;
+    roundedRect(ctx, x, y, width, height, 15 * scale);
+    ctx.fillStyle = palette.media;
+    ctx.fill();
+    ctx.fillStyle = card.accent;
+    ctx.beginPath();
+    ctx.arc(x + 38 * scale, y + 36 * scale, 23 * scale, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = "#ffffff";
+    ctx.font = `600 ${25 * scale}px system-ui, -apple-system, "Segoe UI Emoji", sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(card.icon, x + 38 * scale, y + 36 * scale);
+    ctx.fillStyle = palette.text;
+    ctx.font = `600 ${26 * scale}px system-ui, -apple-system, "Segoe UI Emoji", sans-serif`;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+    ctx.fillText(card.title, x + 76 * scale, y + 14 * scale);
+    ctx.fillStyle = palette.mutedText;
+    ctx.font = `400 ${22 * scale}px system-ui, -apple-system, "Segoe UI Emoji", sans-serif`;
+    layout.cardDetailLines.forEach((line, index) => ctx.fillText(line, x + 76 * scale, y + 45 * scale + index * 27 * scale));
+
+    let itemY = y + Math.max(74 * scale, 56 * scale + layout.cardDetailLines.length * 27 * scale);
+    layout.cardItemLines.forEach((itemLines, index) => {
+      const itemHeight = layout.cardItemHeights[index] ?? 42 * scale;
+      roundedRect(ctx, x + 18 * scale, itemY, width - 36 * scale, itemHeight, 10 * scale);
+      ctx.fillStyle = palette.input;
+      ctx.fill();
+      ctx.fillStyle = card.accent;
+      ctx.beginPath();
+      ctx.arc(x + 37 * scale, itemY + itemHeight / 2, 6 * scale, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = palette.text;
+      ctx.font = `400 ${23 * scale}px system-ui, -apple-system, "Segoe UI Emoji", sans-serif`;
+      ctx.textAlign = "left";
+      ctx.textBaseline = "top";
+      const textY = itemY + (itemHeight - itemLines.length * 28 * scale) / 2;
+      itemLines.forEach((line, lineIndex) => ctx.fillText(line, x + 55 * scale, textY + lineIndex * 28 * scale));
+      itemY += itemHeight + 8 * scale;
+    });
   }
 
   private drawTextLines(lines: string[], x: number, y: number, _width: number, palette: Palette, scale: number, centered: boolean): void {
@@ -1031,20 +1703,37 @@ export class ChatCanvasRenderer {
   private drawMedia(layout: BubbleLayout, x: number, y: number, width: number, height: number, palette: Palette, scale: number): void {
     const ctx = this.ctx;
     const attachment = layout.message.attachment;
-    roundedRect(ctx, x, y, width, height, 14 * scale);
+    const circularVideoNote = shouldRenderCircularVideoNote(layout.message.mediaRole, width, height);
+    if (circularVideoNote) {
+      ctx.beginPath();
+      ctx.arc(x + width / 2, y + height / 2, Math.min(width, height) / 2, 0, Math.PI * 2);
+    } else {
+      roundedRect(ctx, x, y, width, height, 14 * scale);
+    }
     ctx.save();
     ctx.clip();
-    ctx.fillStyle = palette.media;
-    ctx.fillRect(x, y, width, height);
+    const transparentSticker = layout.message.mediaRole === "sticker"
+      && attachment?.status === "found"
+      && Boolean(attachment.archivePath && this.media.getMediaDimensions(attachment.archivePath));
+    if (!transparentSticker) {
+      ctx.fillStyle = palette.media;
+      ctx.fillRect(x, y, width, height);
+    }
     const image = attachment?.archivePath ? this.media.getImage(attachment.archivePath) : undefined;
     const animatedFrame = attachment?.archivePath ? this.media.getAnimatedFrame(attachment.archivePath) : undefined;
     const videoFrame = attachment?.kind === "video" && attachment.archivePath
       ? this.media.getVideoFrame(attachment.archivePath)
       : undefined;
-    const audioClip = attachment?.kind === "audio" && attachment.archivePath
-      ? this.media.getAudioClip(attachment.archivePath)
+    const hasVideoTrack = attachment?.kind === "video" && attachment.archivePath
+      ? this.media.getVideoDuration(attachment.archivePath) !== undefined
+      : false;
+    const audioClip = (attachment?.kind === "audio" || (attachment?.kind === "video" && !hasVideoTrack)) && attachment.archivePath
+      ? this.media.getAudioInfo(attachment.archivePath)
       : undefined;
-    if (audioClip) {
+    const contactCard = attachment?.archivePath ? this.media.getContactCard(attachment.archivePath) : undefined;
+    if (contactCard) {
+      this.drawContactMedia(contactCard, x, y, width, height, palette, scale);
+    } else if (audioClip) {
       this.drawAudioMedia(layout, audioClip, x, y, width, height, palette, scale);
     } else if (animatedFrame) {
       ctx.drawImage(animatedFrame, x, y, width, height);
@@ -1053,7 +1742,9 @@ export class ChatCanvasRenderer {
     } else if (videoFrame) {
       videoFrame.draw(ctx, x, y, width, height);
       const eventAt = this.eventTimes.get(layout.message.id) ?? this.currentTime;
-      const clipDuration = Math.min(MEDIA_PREVIEW_SECONDS, this.media.getVideoDuration(attachment?.archivePath ?? "") ?? MEDIA_PREVIEW_SECONDS);
+      const clipDuration = this.media.getVideoDuration(attachment?.archivePath ?? "")
+        ?? this.eventDurations.get(layout.message.id)
+        ?? 0;
       const elapsed = clamp(this.currentTime - eventAt, 0, clipDuration);
       const progress = clipDuration > 0 ? elapsed / clipDuration : 0;
       ctx.fillStyle = "rgba(0, 0, 0, .28)";
@@ -1065,25 +1756,111 @@ export class ChatCanvasRenderer {
       ctx.font = `500 ${18 * scale}px system-ui, -apple-system, sans-serif`;
       ctx.textAlign = "left";
       ctx.textBaseline = "middle";
-      ctx.fillText(`VIDEO · ${Math.floor(elapsed / 60)}:${String(Math.floor(elapsed % 60)).padStart(2, "0")}`, x + 16 * scale, y + height - 27 * scale);
+      const videoLabel = layout.message.mediaRole === "video-note" ? "VIDEONOTIZ" : layout.message.mediaRole === "animated-image" ? "GIF" : "VIDEO";
+      ctx.fillText(`${videoLabel} · ${Math.floor(elapsed / 60)}:${String(Math.floor(elapsed % 60)).padStart(2, "0")}`, x + 16 * scale, y + height - 27 * scale);
     } else {
-      ctx.fillStyle = palette.mutedText;
-      ctx.font = `500 ${25 * scale}px system-ui, -apple-system, sans-serif`;
+      const card = attachmentCardPresentation(layout.message) ?? { icon: "▧", title: "MEDIUM", detail: attachment?.displayName ?? "Medium" };
+      const accent = attachment?.status === "missing" ? "#d86b65" : attachment?.status === "ambiguous" ? "#d97706" : palette.accent;
+      ctx.fillStyle = accent;
+      ctx.beginPath();
+      ctx.arc(x + 44 * scale, y + height / 2, 28 * scale, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = "#ffffff";
+      ctx.font = `600 ${27 * scale}px system-ui, -apple-system, "Segoe UI Emoji", sans-serif`;
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
-      const icon = attachment?.kind === "video" ? "▶" : attachment?.kind === "audio" ? "◖)))" : attachment?.kind === "document" ? "▤" : "▧";
-      ctx.font = `500 ${46 * scale}px system-ui, -apple-system, sans-serif`;
-      ctx.fillText(icon, x + width / 2, y + height / 2 - 18 * scale);
-      ctx.font = `400 ${22 * scale}px system-ui, -apple-system, sans-serif`;
-      const label = attachment?.status === "missing" ? "Medium nicht gefunden" : attachment?.displayName ?? "Medium";
-      ctx.fillText(label.slice(0, 42), x + width / 2, y + height / 2 + 27 * scale);
+      ctx.fillText(card.icon, x + 44 * scale, y + height / 2);
+      ctx.fillStyle = palette.text;
+      ctx.font = `600 ${21 * scale}px system-ui, -apple-system, sans-serif`;
+      ctx.textAlign = "left";
+      ctx.textBaseline = "top";
+      ctx.fillText(card.title, x + 86 * scale, y + 20 * scale, width - 105 * scale);
+      ctx.fillStyle = palette.mutedText;
+      ctx.font = `400 ${20 * scale}px system-ui, -apple-system, "Segoe UI Emoji", sans-serif`;
+      ctx.fillText(card.detail, x + 86 * scale, y + 50 * scale, width - 105 * scale);
+    }
+    const groupIndex = attachmentGroupIndexLabel(layout.message);
+    if (groupIndex) {
+      ctx.font = `600 ${17 * scale}px system-ui, -apple-system, sans-serif`;
+      const chipWidth = Math.max(43 * scale, ctx.measureText(groupIndex).width + 18 * scale);
+      const chipHeight = 27 * scale;
+      const chipX = circularVideoNote ? x + (width - chipWidth) / 2 : x + width - chipWidth - 10 * scale;
+      const chipY = y + (circularVideoNote ? 20 : 10) * scale;
+      roundedRect(ctx, chipX, chipY, chipWidth, chipHeight, 10 * scale);
+      ctx.fillStyle = "rgba(0, 0, 0, .58)";
+      ctx.fill();
+      ctx.fillStyle = "#ffffff";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(groupIndex, chipX + chipWidth / 2, chipY + chipHeight / 2 + 0.5 * scale);
     }
     ctx.restore();
   }
 
+  private drawContactMedia(
+    contact: ContactCardInfo,
+    x: number,
+    y: number,
+    width: number,
+    height: number,
+    palette: Palette,
+    scale: number,
+  ): void {
+    const ctx = this.ctx;
+    const firstContactName = contact.name.replace(/\s+/gu, " ").trim();
+    const contactCount = 1 + (contact.additionalContacts ?? 0);
+    const cleanName = contactCount > 1 ? `${contactCount} Kontakte` : firstContactName;
+    const previewNames = [firstContactName, ...(contact.additionalContactNames ?? [])].slice(0, 2);
+    const hiddenNames = Math.max(0, contactCount - previewNames.length);
+    const addresses = contact.addresses ?? [];
+    const urls = contact.urls ?? [];
+    const detail = contactCount > 1
+      ? `${previewNames.join(" · ")}${hiddenNames ? ` · +${hiddenNames}` : ""}`
+      : contact.organization?.replace(/\s+/gu, " ").trim()
+      || contact.phones[0]
+      || contact.emails[0]
+      || addresses[0]
+      || urls[0]
+      || contact.birthday
+      || contact.note?.replace(/\s+/gu, " ").trim()
+      || "Geteilter Kontakt";
+    const metadataParts = [
+      contact.phones.length ? `${contact.phones.length} TEL` : "",
+      contact.emails.length ? `${contact.emails.length} E-MAIL` : "",
+      addresses.length ? `${addresses.length} ADRESSE${addresses.length === 1 ? "" : "N"}` : "",
+      urls.length ? `${urls.length} LINK${urls.length === 1 ? "" : "S"}` : "",
+      contact.birthday ? "GEBURTSTAG" : "",
+      contact.note ? "NOTIZ" : "",
+    ].filter(Boolean);
+    const contactMetadata = contactCount > 1
+      ? `${contactCount} KONTAKTE · MEHRFACHKARTE`
+      : metadataParts.length
+        ? metadataParts.join(" · ")
+        : "KONTAKT";
+    ctx.fillStyle = palette.accent;
+    ctx.beginPath();
+    ctx.arc(x + 56 * scale, y + height / 2, 38 * scale, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = "#ffffff";
+    ctx.font = `600 ${24 * scale}px system-ui, -apple-system, sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(initials(cleanName), x + 56 * scale, y + height / 2);
+    ctx.fillStyle = palette.text;
+    ctx.font = `600 ${25 * scale}px system-ui, -apple-system, "Segoe UI Emoji", sans-serif`;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+    ctx.fillText(cleanName, x + 112 * scale, y + 23 * scale, width - 132 * scale);
+    ctx.fillStyle = palette.mutedText;
+    ctx.font = `400 ${21 * scale}px system-ui, -apple-system, "Segoe UI Emoji", sans-serif`;
+    ctx.fillText(detail, x + 112 * scale, y + 58 * scale, width - 132 * scale);
+    ctx.font = `500 ${18 * scale}px system-ui, -apple-system, sans-serif`;
+    ctx.fillText(contactMetadata, x + 112 * scale, y + 91 * scale, width - 132 * scale);
+  }
+
   private drawAudioMedia(
     layout: BubbleLayout,
-    clip: PcmAudioClip,
+    clip: AudioMediaInfo,
     x: number,
     y: number,
     width: number,
@@ -1119,6 +1896,10 @@ export class ChatCanvasRenderer {
     });
 
     ctx.fillStyle = palette.mutedText;
+    ctx.font = `600 ${14 * scale}px system-ui, sans-serif`;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+    ctx.fillText(layout.message.mediaRole === "voice-note" ? "SPRACHNACHRICHT" : "AUDIO", waveformX, y + 7 * scale);
     ctx.font = `500 ${18 * scale}px system-ui, sans-serif`;
     ctx.textAlign = "right";
     ctx.textBaseline = "middle";

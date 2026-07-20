@@ -109,4 +109,27 @@ describe("media store", () => {
     expect(store.getMediaDimensions(asset.path)).toEqual({ width: 240, height: 180 });
     store.dispose();
   });
+
+  it("loads VCard contact details for the contact attachment card", async () => {
+    const asset: ArchiveAsset = {
+      path: "Max.vcf",
+      basename: "Max.vcf",
+      normalizedBasename: "max.vcf",
+      size: 120,
+      kind: "document",
+      mimeType: "text/vcard",
+      loadBlob: async () => new Blob([
+        "BEGIN:VCARD\nFN:Max Mustermann\nTEL:+49 123\nEMAIL:max@example.com\nEND:VCARD",
+      ], { type: "text/vcard" }),
+    };
+    const store = new AssetMediaStore(projectWith(asset));
+    await store.load(asset.path);
+    expect(store.getContactCard(asset.path)).toEqual({
+      name: "Max Mustermann",
+      phones: ["+49 123"],
+      emails: ["max@example.com"],
+    });
+    store.dispose();
+    expect(store.getContactCard(asset.path)).toBeUndefined();
+  });
 });

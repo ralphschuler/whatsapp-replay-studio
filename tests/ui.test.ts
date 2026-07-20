@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 
 function canvasContextStub(): CanvasRenderingContext2D {
   const methods = new Set([
@@ -37,11 +37,13 @@ describe("application flow", () => {
     expect((document.getElementById("play-button") as HTMLButtonElement).disabled).toBe(true);
   });
 
-  it("loads the demo and enables replay controls", () => {
+  it("loads the demo and enables replay controls", async () => {
     (document.getElementById("demo-button") as HTMLButtonElement).click();
     expect((document.getElementById("editor") as HTMLElement).hidden).toBe(false);
     expect(document.getElementById("stat-messages")?.textContent).toBe("7");
-    expect((document.getElementById("play-button") as HTMLButtonElement).disabled).toBe(false);
+    await vi.waitFor(() => {
+      expect((document.getElementById("play-button") as HTMLButtonElement).disabled).toBe(false);
+    });
     expect((document.getElementById("self-name") as HTMLSelectElement).options.length).toBe(2);
     expect(Number((document.getElementById("scrubber") as HTMLInputElement).max)).toBeGreaterThan(1);
     expect((document.getElementById("incoming-sound") as HTMLInputElement).checked).toBe(true);

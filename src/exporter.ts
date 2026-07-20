@@ -69,6 +69,7 @@ export async function exportReplayMp4(options: ExportOptions): Promise<Blob> {
   const frameDuration = 1 / fps;
   const totalFrames = Math.max(1, Math.ceil(options.timeline.duration * fps));
   let audioPromise: Promise<void> = Promise.resolve();
+  const audioFailure: { error?: unknown } = {};
   let videoClosed = false;
   let exportSessionActive = false;
   const closeVideo = (): void => {
@@ -80,19 +81,23 @@ export async function exportReplayMp4(options: ExportOptions): Promise<Blob> {
   try {
     await options.mediaStore.beginExportSession(options.timeline, fps);
     exportSessionActive = true;
-    audioPromise = audioSource
+    const rawAudioPromise = audioSource
       ? streamReplayAudio(
         audioSource,
         options.timeline,
         options.theme.selfName,
         scheduledAudioAssets,
-        (path) => options.mediaStore.loadAudioClip(path),
+        (path, start, duration) => options.mediaStore.loadAudioSegment(path, start, duration),
         options.incomingSound,
         options.signal,
       )
       : Promise.resolve();
+    audioPromise = rawAudioPromise.catch((error: unknown) => {
+      audioFailure.error = error;
+    });
     for (let frame = 0; frame < totalFrames; frame += 1) {
       if (options.signal?.aborted) throw abortError();
+      if ("error" in audioFailure) throw audioFailure.error;
       const time = frame * frameDuration;
       await renderer.prepareFrame(options.timeline, time, true);
       renderer.render(options.timeline, time, options.theme);
@@ -104,6 +109,7 @@ export async function exportReplayMp4(options: ExportOptions): Promise<Blob> {
     }
     closeVideo();
     await audioPromise;
+    if ("error" in audioFailure) throw audioFailure.error;
     await options.mediaStore.endExportSession();
     exportSessionActive = false;
     options.onProgress?.({ phase: "finalize", progress: 0.98, frame: totalFrames, totalFrames });

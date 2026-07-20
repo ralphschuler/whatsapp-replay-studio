@@ -53,6 +53,89 @@ describe("timeline compiler", () => {
     expect(timeline.events[1]!.at - timeline.events[0]!.at).toBeGreaterThan(4);
   });
 
+  it("uses the full probed duration for video and audio", () => {
+    const video = message(0, 0);
+    video.kind = "media";
+    video.attachment = {
+      archivePath: "clip.mp4",
+      displayName: "clip.mp4",
+      kind: "video",
+      mimeType: "video/mp4",
+      size: 100,
+      status: "found",
+    };
+    const audio = message(1, 1);
+    audio.kind = "media";
+    audio.attachment = {
+      archivePath: "voice.opus",
+      displayName: "voice.opus",
+      kind: "audio",
+      mimeType: "audio/opus",
+      size: 100,
+      status: "found",
+    };
+    const durations = new Map([["clip.mp4", 12.5], ["voice.opus", 65.75]]);
+    const timeline = compileTimeline([video, audio], undefined, durations);
+
+    expect(timeline.events[0]!.mediaDuration).toBe(12.5);
+    expect(timeline.events[1]!.at - timeline.events[0]!.at).toBeGreaterThanOrEqual(12.8);
+    expect(timeline.events[1]!.mediaDuration).toBe(65.75);
+    expect(timeline.duration).toBeGreaterThanOrEqual(timeline.events[1]!.at + 66.05);
+  });
+
+  it("plays every grouped media attachment sequentially for its full duration", () => {
+    const media = [
+      ["clip.mov", "video", "video/quicktime"],
+      ["voice.opus", "audio", "audio/opus"],
+      ["follow-up.mp4", "video", "video/mp4"],
+    ].map(([archivePath, kind, mimeType], index) => {
+      const item = message(index, 0, index === 0 ? "Albumtitel" : "");
+      item.id = `album-${index}`;
+      item.kind = "media";
+      item.logicalMessageId = "album";
+      item.attachmentGroup = { id: "album", index, size: 3, kind: "explicit-multi" };
+      item.attachment = {
+        archivePath: archivePath!,
+        displayName: archivePath!,
+        kind: kind as "video" | "audio",
+        mimeType: mimeType!,
+        size: 100,
+        status: "found",
+      };
+      return item;
+    });
+    const durations = new Map([
+      ["clip.mov", 12.5],
+      ["voice.opus", 65.75],
+      ["follow-up.mp4", 7.25],
+    ]);
+
+    const timeline = compileTimeline(media, undefined, durations);
+
+    expect(timeline.events.map((event) => event.mediaDuration)).toEqual([12.5, 65.75, 7.25]);
+    expect(timeline.events[1]!.at).toBeGreaterThanOrEqual(timeline.events[0]!.at + 12.8);
+    expect(timeline.events[2]!.at).toBeGreaterThanOrEqual(timeline.events[1]!.at + 66.05);
+    expect(timeline.duration).toBeGreaterThanOrEqual(timeline.events[2]!.at + 7.55);
+  });
+
+  it("falls back safely for invalid media durations", () => {
+    const video = message(0, 0);
+    video.kind = "media";
+    video.attachment = {
+      archivePath: "clip.mp4",
+      displayName: "clip.mp4",
+      kind: "video",
+      mimeType: "video/mp4",
+      size: 100,
+      status: "found",
+    };
+    for (const invalid of [Number.NaN, Number.POSITIVE_INFINITY, 0, -1]) {
+      const timeline = compileTimeline([video], undefined, new Map([["clip.mp4", invalid]]));
+      expect(timeline.events[0]!.mediaDuration).toBe(4);
+      expect(Number.isFinite(timeline.duration)).toBe(true);
+    }
+  });
+
   it("also holds audio and GIF messages long enough to play", () => {
     const audio = message(0, 0);
     audio.kind = "media";
