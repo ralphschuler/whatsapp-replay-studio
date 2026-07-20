@@ -1,6 +1,7 @@
 import "./style.css";
 import { DingPlayer } from "./audio";
 import { exportReplayMp4, type ExportProgress } from "./exporter";
+import { chatTitleFromFilename, messageDirection, resolveSelfIdentity, SELF_NOT_IN_EXPORT } from "./identity";
 import { importWhatsAppExport, reparseProject } from "./importer";
 import { parseChat } from "./parser";
 import { AssetMediaStore, ChatCanvasRenderer } from "./renderer";
@@ -39,6 +40,7 @@ const previewCanvas = element<HTMLCanvasElement>("preview-canvas");
 const emptyPreview = element<HTMLDivElement>("empty-preview");
 const dateOrderSelect = element<HTMLSelectElement>("date-order");
 const selfSelect = element<HTMLSelectElement>("self-name");
+const selfHint = element<HTMLElement>("self-hint");
 const titleInput = element<HTMLInputElement>("chat-title");
 const startRange = element<HTMLInputElement>("start-range");
 const endRange = element<HTMLInputElement>("end-range");
@@ -78,6 +80,7 @@ let mediaReady = false;
 let baseDiagnostics = "";
 let previousPlaybackTime = 0;
 let playbackGeneration = 0;
+let selfSelectionSource: "filename" | "manual" | "unresolved" = "unresolved";
 const playedAudioEvents = new Set<string>();
 const audioPlayer = new DingPlayer();
 
@@ -160,16 +163,13 @@ function setExportBusy(busy: boolean): void {
   ];
   for (const control of controls) control.disabled = busy;
   if (!busy) {
-    playButton.disabled = !project || !mediaReady;
+    const identityReady = Boolean(selfSelect.value);
+    playButton.disabled = !project || !mediaReady || !identityReady;
     scrubber.disabled = !project;
-    exportButton.disabled = !project || !mediaReady;
+    exportButton.disabled = !project || !mediaReady || !identityReady;
   }
   dropZone.classList.toggle("is-disabled", busy);
   dropZone.setAttribute("aria-disabled", String(busy));
-}
-
-function sanitizeTitle(filename: string): string {
-  return filename.replace(/\.(?:zip|txt)$/iu, "").replace(/^_?chat(?: with| mit)?\s*/iu, "").replace(/[_-]+/gu, " ").trim() || "WhatsApp Replay";
 }
 
 function applyCanvasPreset(): void {
@@ -288,8 +288,7 @@ function playbackFrame(now: number): void {
       event.at > Math.max(before, previousPlaybackTime) && event.at <= currentTime,
     );
     const hasIncoming = crossedEvents.some((event) =>
-      Boolean(event.message.sender)
-      && event.message.sender !== selfSelect.value
+      messageDirection(event.message, selfSelect.value) === "incoming"
       && (event.message.attachmentGroup?.index ?? 0) === 0,
     );
     if (incomingSoundInput.checked && hasIncoming) void audioPlayer.play();
@@ -305,8 +304,38 @@ function logicalMessageCount(messages: ImportedProject["chat"]["messages"]): num
   return logicalMessageGroups(messages).length;
 }
 
+function updateSelfHint(): void {
+  selfSelect.setAttribute("aria-invalid", String(!selfSelect.value));
+  if (!selfSelect.value) {
+    selfHint.textContent = "Bitte auswählen. WhatsApp exportiert den Absender, aber keinen separaten Empfänger.";
+    selfHint.dataset.state = "warning";
+  } else if (selfSelect.value === SELF_NOT_IN_EXPORT) {
+    selfHint.textContent = "Alle Nachrichten werden als eingehend behandelt, weil du nicht als Absender enthalten bist.";
+    selfHint.dataset.state = "ready";
+  } else if (selfSelectionSource === "filename") {
+    selfHint.textContent = "Aus dem standardisierten 1:1-Dateinamen abgeleitet – bitte kurz prüfen.";
+    selfHint.dataset.state = "ready";
+  } else {
+    selfHint.textContent = "Ein- und ausgehende Nachrichten werden anhand dieser Auswahl zugeordnet.";
+    selfHint.dataset.state = "ready";
+  }
+}
+
+function setProjectReadyStatus(): void {
+  if (!project || !mediaReady || !mediaStore) return;
+  const mediaIssueCount = mediaStore.getMediaIssues(project.chat.messages).length;
+  const count = logicalMessageCount(project.chat.messages).toLocaleString("de-DE");
+  if (!selfSelect.value) {
+    setStatus(`${count} Nachrichten sind bereit. Bitte wähle unter „Ich bin“ deinen Absender aus.`, "info");
+  } else if (mediaIssueCount) {
+    setStatus(`${count} Nachrichten sind bereit; ${mediaIssueCount} Medienhinweis${mediaIssueCount === 1 ? "" : "e"}.`, "info");
+  } else {
+    setStatus(`${count} Nachrichten und Medienlängen sind bereit.`, "success");
+  }
+}
+
 function togglePlayback(): void {
-  if (!timeline.events.length) return;
+  if (!timeline.events.length || !selfSelect.value) return;
   if (playing) {
     stopPlayback();
     return;
@@ -351,16 +380,16 @@ async function prepareMediaForPreview(): Promise<void> {
   diagnostic.hidden = !diagnostic.textContent;
   mediaReady = true;
   setExportBusy(false);
-  setStatus(
-    mediaIssues.length
-      ? `${logicalMessageCount(activeProject.chat.messages).toLocaleString("de-DE")} Nachrichten sind bereit; ${mediaIssues.length} Medienhinweis${mediaIssues.length === 1 ? "" : "e"}.`
-      : `${logicalMessageCount(activeProject.chat.messages).toLocaleString("de-DE")} Nachrichten und Medienlängen sind bereit.`,
-    mediaIssues.length ? "info" : "success",
-  );
+  setProjectReadyStatus();
   redraw();
 }
 
-function populateProject(nextProject: ImportedProject, keepTitle = false): void {
+function populateProject(nextProject: ImportedProject, options: {
+  keepTitle?: boolean;
+  preferredSelfName?: string;
+  preferredSource?: typeof selfSelectionSource;
+} = {}): void {
+  const { keepTitle = false, preferredSelfName, preferredSource = "manual" } = options;
   stopPlayback();
   mediaPreparationGeneration += 1;
   mediaReady = false;
@@ -378,15 +407,36 @@ function populateProject(nextProject: ImportedProject, keepTitle = false): void 
   setText("stat-messages", logicalMessageCount(project.chat.messages).toLocaleString("de-DE"));
   setText("stat-participants", String(project.chat.participants.length));
   setText("stat-media", String(project.attachmentStats.matched));
-  if (!keepTitle) titleInput.value = sanitizeTitle(project.filename);
+  if (!keepTitle) titleInput.value = chatTitleFromFilename(project.filename);
 
   selfSelect.replaceChildren();
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = "Bitte auswählen …";
+  placeholder.disabled = true;
+  selfSelect.append(placeholder);
   for (const participant of project.chat.participants) {
     const option = document.createElement("option");
     option.value = participant;
     option.textContent = participant;
     selfSelect.append(option);
   }
+  const noSelfOption = document.createElement("option");
+  noSelfOption.value = SELF_NOT_IN_EXPORT;
+  noSelfOption.textContent = "Nicht enthalten – nur empfangen";
+  selfSelect.append(noSelfOption);
+  const identity = resolveSelfIdentity({
+    participants: project.chat.participants,
+    filename: project.filename,
+    chatFilename: project.chatFilename,
+    messages: project.chat.messages,
+    preferredSelfName,
+  });
+  selfSelect.value = identity.selfName ?? "";
+  selfSelectionSource = identity.source === "filename"
+    ? "filename"
+    : identity.selfName ? preferredSource : "unresolved";
+  updateSelfHint();
 
   const max = Math.max(0, logicalMessageCount(project.chat.messages) - 1);
   startRange.max = String(max);
@@ -435,7 +485,7 @@ function loadDemo(): void {
     attachmentStats: { matched: 0, missing: 0, ambiguous: 0, unreferenced: 0 },
   };
   titleInput.value = "Abend mit Freunden";
-  populateProject(demo, true);
+  populateProject(demo, { keepTitle: true, preferredSelfName: "Ralph", preferredSource: "manual" });
 }
 
 function handleExportProgress(progress: ExportProgress): void {
@@ -448,7 +498,7 @@ function handleExportProgress(progress: ExportProgress): void {
 }
 
 async function startExport(): Promise<void> {
-  if (!project || !mediaStore || !timeline.events.length) return;
+  if (!project || !mediaStore || !timeline.events.length || !selfSelect.value) return;
   stopPlayback();
   exportController = new AbortController();
   setExportBusy(true);
@@ -518,7 +568,11 @@ demoButton.addEventListener("click", loadDemo);
 dateOrderSelect.addEventListener("change", () => {
   if (!project) return;
   const reparsed = reparseProject(project, dateOrderSelect.value as DateOrder);
-  populateProject(reparsed, true);
+  populateProject(reparsed, {
+    keepTitle: true,
+    preferredSelfName: selfSelect.value,
+    preferredSource: selfSelectionSource,
+  });
 });
 startRange.addEventListener("input", () => {
   if (Number(startRange.value) > Number(endRange.value)) endRange.value = startRange.value;
@@ -529,7 +583,14 @@ endRange.addEventListener("input", () => {
   updateTimeline(true);
 });
 [timingModeSelect, paceSelect, speedFactorSelect].forEach((control) => control.addEventListener("change", () => updateTimeline()));
-[selfSelect, titleInput, themeSelect, anonymizeInput].forEach((control) => control.addEventListener("input", redraw));
+selfSelect.addEventListener("input", () => {
+  selfSelectionSource = selfSelect.value ? "manual" : "unresolved";
+  updateSelfHint();
+  setExportBusy(false);
+  setProjectReadyStatus();
+  redraw();
+});
+[titleInput, themeSelect, anonymizeInput].forEach((control) => control.addEventListener("input", redraw));
 presetSelect.addEventListener("change", applyCanvasPreset);
 playButton.addEventListener("click", togglePlayback);
 scrubber.addEventListener("input", () => { stopPlayback(); currentTime = Number(scrubber.value); redraw(); });

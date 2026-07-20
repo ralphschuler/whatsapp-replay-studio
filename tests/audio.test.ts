@@ -7,6 +7,7 @@ import {
   streamReplayAudio,
   synthesizeDingChannel,
 } from "../src/audio";
+import { SELF_NOT_IN_EXPORT } from "../src/identity";
 import { compileTimeline } from "../src/timeline";
 import type { AudioBufferSource } from "mediabunny";
 import type { ChatMessage, CompiledTimeline, PcmAudioClip } from "../src/types";
@@ -29,6 +30,8 @@ describe("incoming ding", () => {
   it("only schedules sounds for incoming messages", () => {
     const timeline = compileTimeline([message(0, "Ralph"), message(1, "Mia"), message(2, "Ralph"), message(3, "Mia")]);
     expect(incomingMessageTimes(timeline, "Ralph")).toEqual([timeline.events[1]!.at, timeline.events[3]!.at]);
+    expect(incomingMessageTimes(timeline, "")).toEqual([]);
+    expect(incomingMessageTimes(timeline, SELF_NOT_IN_EXPORT)).toEqual(timeline.events.map((event) => event.at));
   });
 
   it("schedules one incoming sound for one logical multi-attachment message", () => {

@@ -65,7 +65,11 @@
                 <span class="step">2</span><div><h2>Replay einrichten</h2><p>Person, Zeitraum und Timing</p></div>
               </div>
               <div class="field-grid">
-                <label class="field"><span>Meine Nachrichten</span><select id="self-name"></select></label>
+                <label class="field">
+                  <span>Ich bin (Absender)</span>
+                  <select id="self-name" aria-describedby="self-hint" required></select>
+                  <small id="self-hint" class="field-hint"></small>
+                </label>
                 <label class="field"><span>Chat-Titel</span><input id="chat-title" type="text" maxlength="48" /></label>
               </div>
               <div class="range-group">

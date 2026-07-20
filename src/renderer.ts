@@ -1,4 +1,5 @@
 import { ALL_FORMATS, AudioBufferSink, BlobSource, Input, VideoSample, VideoSampleSink } from "mediabunny";
+import { messageDirection } from "./identity";
 import { visibleEventCount } from "./timeline";
 import { parseVCard, type ContactCardInfo } from "./vcard";
 import type {
@@ -474,7 +475,7 @@ function pseudonym(name: string, participants: string[]): string {
 
 function senderLabel(message: ChatMessage, theme: RenderTheme, participants: string[]): string {
   if (!isFirstAttachmentGroupItem(message)) return "";
-  if (!message.sender || message.sender === theme.selfName) return "";
+  if (!message.sender || messageDirection(message, theme.selfName) === "outgoing") return "";
   return theme.anonymize ? pseudonym(message.sender, participants) : message.sender;
 }
 
@@ -1543,8 +1544,9 @@ export class ChatCanvasRenderer {
   private drawBubble(layout: BubbleLayout, theme: RenderTheme, palette: Palette, y: number, scale: number): void {
     const ctx = this.ctx;
     const w = this.canvas.width;
-    const isSystem = !layout.message.sender;
-    const mine = layout.message.sender === theme.selfName;
+    const direction = messageDirection(layout.message, theme.selfName);
+    const isSystem = direction === "system";
+    const mine = direction === "outgoing";
     const width = isSystem ? Math.min(720 * scale, layout.width) : layout.width;
     const x = isSystem ? (w - width) / 2 : mine ? w - 34 * scale - width : 34 * scale;
     const stickerPath = layout.message.attachment?.archivePath;

@@ -13,13 +13,14 @@ Die gebaute Datei `dist/index.html` ist vollständig eigenständig. Sie kann per
 1. In WhatsApp den gewünschten Chat öffnen.
 2. **Chat exportieren** und optional **Medien einschließen** wählen.
 3. Die ZIP in WhatsApp Replay Studio ziehen.
-4. Die eigene Person, den Zeitraum, das Timing und das Videoformat auswählen.
+4. Unter **Ich bin** die eigene Person prüfen beziehungsweise auswählen, dann Zeitraum, Timing und Videoformat festlegen.
 5. Vorschau prüfen und **MP4 erstellen** anklicken.
 
 ## Unterstützt
 
 - Android- und iOS-Exportformate
 - Deutsche und englische Zeitstempel, 12-/24-Stunden-Format
+- Sichere Erkennung der eigenen Person bei eindeutigen 1:1-Dateinamen wie `WhatsApp Chat - Name.zip`; bei Gruppen oder unklaren Exporten ist eine bewusste Auswahl erforderlich
 - Mehrzeilige Nachrichten, Systemmeldungen und gleiche Zeitstempel
 - Bilder, transparente Sticker, vollständige GIF-Zyklen und – bei Browser-Unterstützung – animierte WebP-Dateien mit ihrem ursprünglichen Seitenverhältnis
 - Mehrere ausdrücklich in einem Chateintrag referenzierte Anhänge als zusammengehörige Medienfolge; keine unsichere Zuordnung anhand der ZIP-Reihenfolge
@@ -52,7 +53,7 @@ Voraussetzung ist Node.js 20 oder neuer. Der Build bündelt alle Abhängigkeiten
 - **Kontextkennzeichen:** „Weitergeleitet“, „Häufig weitergeleitet“ und „Bearbeitet“ werden nur bei einem entsprechenden Marker angezeigt. Explizite `>`-Textblöcke erscheinen als Zitat; eine nicht exportierte Reply-Beziehung wird daraus nicht abgeleitet.
 - **Verlustfreier Fallback:** Ein unbekannter oder noch nicht spezialisierter Nachrichtentyp bleibt mit seinem vollständigen Originaltext erhalten. Teilnehmernachrichten erscheinen als normale Textnachricht, senderlose Ereignisse als generischer Systemchip, statt beim Import verworfen zu werden.
 - **Lange Inhalte:** Hohe Medien werden proportional in die verfügbare Chatfläche eingepasst. Überlange Text-, Zitat- und Spezialkarten scrollen während ihrer verlängerten Standzeit vollständig von oben nach unten.
-- **Grenzen des Exports:** Spezialkarten werden nur aus expliziten, hinreichend strukturierten Exportmarkern erzeugt. Fehlende Umfragestimmen oder Wähler, Reply- und Reaktionsbeziehungen, Bearbeitungshistorien, Lesebestätigungen, Zustellstatus, Sterne, verschwundene Inhalte und die ursprünglichen Daten gelöschter oder abgelaufener Einmalansicht-Nachrichten können nicht rekonstruiert werden. Das gilt ebenso für andere Informationen, die WhatsApp nicht in die TXT- oder ZIP-Datei schreibt.
+- **Grenzen des Exports:** WhatsApp schreibt pro Nachricht den Absender, aber kein separates Empfängerfeld in die TXT-Datei. Das Tool leitet ein- und ausgehend deshalb aus der Auswahl **Ich bin** ab; im Direktchat ist die Gegenseite der Empfänger, in Gruppen der Chat als Ganzes. Spezialkarten werden nur aus expliziten, hinreichend strukturierten Exportmarkern erzeugt. Fehlende Umfragestimmen oder Wähler, Reply- und Reaktionsbeziehungen, Bearbeitungshistorien, Lesebestätigungen, Zustellstatus, Sterne, verschwundene Inhalte und die ursprünglichen Daten gelöschter oder abgelaufener Einmalansicht-Nachrichten können nicht rekonstruiert werden. Das gilt ebenso für andere Informationen, die WhatsApp nicht in die TXT- oder ZIP-Datei schreibt.
 
 ## GitHub Pages
 

@@ -44,7 +44,9 @@ describe("application flow", () => {
     await vi.waitFor(() => {
       expect((document.getElementById("play-button") as HTMLButtonElement).disabled).toBe(false);
     });
-    expect((document.getElementById("self-name") as HTMLSelectElement).options.length).toBe(2);
+    const selfSelect = document.getElementById("self-name") as HTMLSelectElement;
+    expect(selfSelect.options.length).toBe(4);
+    expect(selfSelect.value).toBe("Ralph");
     expect(Number((document.getElementById("scrubber") as HTMLInputElement).max)).toBeGreaterThan(1);
     expect((document.getElementById("incoming-sound") as HTMLInputElement).checked).toBe(true);
   });
@@ -60,5 +62,52 @@ describe("application flow", () => {
     anonymize.click();
     expect(anonymize.checked).toBe(true);
     expect(document.getElementById("stat-messages")?.textContent).toBe("7");
+  });
+
+  it("keeps the chosen sender when the date format is reparsed", async () => {
+    const selfSelect = document.getElementById("self-name") as HTMLSelectElement;
+    selfSelect.value = "Mia";
+    selfSelect.dispatchEvent(new Event("input"));
+    const dateOrder = document.getElementById("date-order") as HTMLSelectElement;
+    dateOrder.value = "auto";
+    dateOrder.dispatchEvent(new Event("change"));
+    expect(selfSelect.value).toBe("Mia");
+    await vi.waitFor(() => {
+      expect((document.getElementById("play-button") as HTMLButtonElement).disabled).toBe(false);
+    });
+  });
+
+  it("infers the owner from a direct-chat filename without carrying over the old selection", async () => {
+    const file = new File([
+      "20.07.26, 09:03 - Mia: Eingehend\n20.07.26, 09:04 - Ralph: Ausgehend",
+    ], "WhatsApp Chat - Mia.txt", { type: "text/plain" });
+    const fileInput = document.getElementById("file-input") as HTMLInputElement;
+    Object.defineProperty(fileInput, "files", { configurable: true, value: [file] });
+    fileInput.dispatchEvent(new Event("change"));
+    const selfSelect = document.getElementById("self-name") as HTMLSelectElement;
+    await vi.waitFor(() => expect(selfSelect.value).toBe("Ralph"));
+    expect((document.getElementById("chat-title") as HTMLInputElement).value).toBe("Mia");
+    await vi.waitFor(() => {
+      expect((document.getElementById("play-button") as HTMLButtonElement).disabled).toBe(false);
+    });
+  });
+
+  it("requires an explicit owner for an ambiguous group export", async () => {
+    const file = new File([
+      [
+        "20.07.26, 09:03 - Mia: Eins",
+        "20.07.26, 09:04 - Ralph: Zwei",
+        "20.07.26, 09:05 - Tom: Drei",
+      ].join("\n"),
+    ], "WhatsApp Chat - Mia.txt", { type: "text/plain" });
+    const fileInput = document.getElementById("file-input") as HTMLInputElement;
+    Object.defineProperty(fileInput, "files", { configurable: true, value: [file] });
+    fileInput.dispatchEvent(new Event("change"));
+    const selfSelect = document.getElementById("self-name") as HTMLSelectElement;
+    await vi.waitFor(() => expect(document.getElementById("stat-messages")?.textContent).toBe("3"));
+    expect(selfSelect.value).toBe("");
+    expect(selfSelect.getAttribute("aria-invalid")).toBe("true");
+    expect((document.getElementById("play-button") as HTMLButtonElement).disabled).toBe(true);
+    expect((document.getElementById("export-button") as HTMLButtonElement).disabled).toBe(true);
   });
 });

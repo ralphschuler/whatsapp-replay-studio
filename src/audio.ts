@@ -1,5 +1,6 @@
 import type { CompiledTimeline, PcmAudioClip, ScheduledAudioAsset, ScheduledAudioClip } from "./types";
 import type { AudioBufferSource } from "mediabunny";
+import { messageDirection } from "./identity";
 
 const DING_DURATION = 0.46;
 const DING_SECOND_TONE_OFFSET = 0.105;
@@ -47,8 +48,7 @@ export function scheduleDecodedAudioSegment(
 
 export function incomingMessageTimes(timeline: CompiledTimeline, selfName: string): number[] {
   return timeline.events
-    .filter((event) => Boolean(event.message.sender)
-      && event.message.sender !== selfName
+    .filter((event) => messageDirection(event.message, selfName) === "incoming"
       && (event.message.attachmentGroup?.index ?? 0) === 0)
     .map((event) => event.at);
 }
