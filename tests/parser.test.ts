@@ -140,6 +140,67 @@ describe("WhatsApp parser", () => {
     ]);
   });
 
+  it("keeps a rarer colon name when its shorter prefix is also a frequent participant", () => {
+    const chat = parseChat([
+      "20.07.26, 09:00 - ACME: Allgemeine Nachricht",
+      "20.07.26, 09:01 - ACME: Noch eine Nachricht",
+      "20.07.26, 09:02 - ACME: Dritte Nachricht",
+      "20.07.26, 09:03 - ACME: Support: Erste Antwort",
+      "20.07.26, 09:04 - ACME: Support: Zweite Antwort",
+    ].join("\n"));
+
+    expect(chat.messages.map(({ sender, text }) => ({ sender, text }))).toEqual([
+      { sender: "ACME", text: "Allgemeine Nachricht" },
+      { sender: "ACME", text: "Noch eine Nachricht" },
+      { sender: "ACME", text: "Dritte Nachricht" },
+      { sender: "ACME: Support", text: "Erste Antwort" },
+      { sender: "ACME: Support", text: "Zweite Antwort" },
+    ]);
+  });
+
+  it("keeps repeated location labels in Ralph's message body", () => {
+    const chat = parseChat([
+      "20.07.26, 09:03 - Ralph: Ganz normale Nachricht",
+      "20.07.26, 09:04 - Ralph: Standort: https://maps.google.com/?q=52.520008,13.404954",
+      "20.07.26, 09:05 - Ralph: Noch eine Nachricht",
+      "20.07.26, 09:06 - Ralph: Standort: https://maps.google.com/?q=51.050409,13.737262",
+    ].join("\n"));
+
+    expect(chat.participants).toEqual(["Ralph"]);
+    expect(chat.messages.map((message) => message.sender)).toEqual(["Ralph", "Ralph", "Ralph", "Ralph"]);
+    expect(chat.messages.filter((message) => message.semantic?.type === "location")).toHaveLength(2);
+  });
+
+  it("keeps repeated English location labels out of the sender name", () => {
+    const chat = parseChat([
+      "7/20/26, 9:03 AM - Ralph: Location: https://maps.google.com/?q=52.520008,13.404954",
+      "7/20/26, 9:04 AM - Ralph: Location: https://maps.google.com/?q=51.050409,13.737262",
+      "7/20/26, 9:05 AM - Ralph: Live location: Central Station",
+      "7/20/26, 9:06 AM - Ralph: Live location: Town Hall",
+    ].join("\n"), "mdy");
+
+    expect(chat.participants).toEqual(["Ralph"]);
+    expect(chat.messages.map((message) => message.sender)).toEqual(["Ralph", "Ralph", "Ralph", "Ralph"]);
+    expect(chat.messages.map((message) => message.semantic?.type)).toEqual(["location", "location", "location", "location"]);
+  });
+
+  it("keeps repeated multiline poll labels out of the sender name", () => {
+    const chat = parseChat([
+      "7/20/26, 9:03 AM - Ralph: Poll:",
+      "Lunch?",
+      "1. Pizza",
+      "2. Salad",
+      "7/20/26, 9:04 AM - Ralph: Poll:",
+      "Trip?",
+      "1. Berlin",
+      "2. Hamburg",
+    ].join("\n"), "mdy");
+
+    expect(chat.participants).toEqual(["Ralph"]);
+    expect(chat.messages.map((message) => message.sender)).toEqual(["Ralph", "Ralph"]);
+    expect(chat.messages.map((message) => message.semantic?.type)).toEqual(["poll", "poll"]);
+  });
+
   it("rejects impossible calendar dates", () => {
     const chat = parseChat("31.02.26, 09:03 - Ralph: Unmöglich");
     expect(chat.messages).toHaveLength(0);
@@ -355,6 +416,18 @@ describe("WhatsApp parser", () => {
         [null, "system", "number-changed"],
         [null, "system", "privacy"],
       ]);
+      expect(chat.participants).toEqual([]);
+    });
+
+    it("does not turn the group title into a participant for German group-link events", () => {
+      const message = "[20.07.2026, 11:13:00] Knöbelblöck: \u200eDu bist über einen Gruppenlink beigetreten.";
+      const chat = parseChat(message);
+
+      expect(chat.messages[0]).toMatchObject({
+        sender: null,
+        kind: "system",
+        semantic: { type: "event", variant: "participant-joined" },
+      });
       expect(chat.participants).toEqual([]);
     });
 

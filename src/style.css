@@ -545,6 +545,15 @@ input[type="range"] {
   cursor: not-allowed;
 }
 
+.export-storage-note {
+  display: block;
+  margin: 9px 4px 0;
+  color: var(--muted-text);
+  font-size: 11px;
+  line-height: 1.45;
+  text-align: center;
+}
+
 .secondary-button {
   color: var(--ink);
   background: rgba(255, 255, 255, .95);

@@ -13,8 +13,11 @@ const MAX_ARCHIVE_BYTES = 750 * 1024 * 1024;
 const MAX_FILES = 12_000;
 const MAX_UNCOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_TEXT_BYTES = 80 * 1024 * 1024;
-const MAX_SIGNATURE_PROBE_BYTES = 64 * 1024 * 1024;
-const MAX_SIGNATURE_PROBE_TOTAL_BYTES = 192 * 1024 * 1024;
+// JSZip cannot read a range from a compressed entry: even a 64-byte signature
+// check expands the complete file first. Only unknown containers need this
+// fallback, and keeping the budget small prevents import-time memory spikes.
+const MAX_SIGNATURE_PROBE_BYTES = 16 * 1024 * 1024;
+const MAX_SIGNATURE_PROBE_TOTAL_BYTES = 32 * 1024 * 1024;
 const ASSET_EXTENSION = /\.[a-z0-9]{1,16}$/iu;
 
 interface ZipSizes {
@@ -153,7 +156,12 @@ async function probeReferencedAssetSignatures(messages: ChatMessage[], assets: A
   let remainingProbeBytes = MAX_SIGNATURE_PROBE_TOTAL_BYTES;
   for (const path of paths) {
     const asset = byPath.get(path);
-    if (!asset || asset.size > MAX_SIGNATURE_PROBE_BYTES || asset.size > remainingProbeBytes) continue;
+    if (
+      !asset
+      || asset.mimeType !== "application/octet-stream"
+      || asset.size > MAX_SIGNATURE_PROBE_BYTES
+      || asset.size > remainingProbeBytes
+    ) continue;
     remainingProbeBytes -= Math.max(64, asset.size);
     try {
       const blob = await asset.loadBlob();

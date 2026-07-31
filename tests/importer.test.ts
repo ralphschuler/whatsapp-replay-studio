@@ -229,4 +229,23 @@ describe("ZIP importer", () => {
       status: "found",
     });
   });
+
+  it("does not inflate recognized media merely to re-sniff its signature", async () => {
+    const zip = new JSZip();
+    zip.file("_chat.txt", "[17.07.26, 09:57:57] Ralph: <attached: photo.jpg>");
+    // If the importer unnecessarily probes this known extension, these bytes
+    // would misclassify the JPEG as Ogg audio.
+    zip.file("photo.jpg", new Uint8Array([0x4f, 0x67, 0x67, 0x53]));
+    const bytes = await zip.generateAsync({ type: "uint8array" });
+    const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+
+    const project = await importWhatsAppExport(new File([buffer], "Chat.zip", { type: "application/zip" }));
+
+    expect(project.chat.messages[0]?.attachment).toMatchObject({
+      displayName: "photo.jpg",
+      kind: "image",
+      mimeType: "image/jpeg",
+      status: "found",
+    });
+  });
 });

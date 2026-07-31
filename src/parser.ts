@@ -640,7 +640,7 @@ function systemEventSemantic(text: string, sender: string | null): MessageSemant
     { pattern: /^(?:this business uses a secure service from meta to manage this chat|dieses unternehmen nutzt einen sicheren service von meta,? um diesen chat zu verwalten)(?:[.!]\s*(?:tap|tippe).*)?[.!]?$/iu, variant: "business-notice", title: "Unternehmenshinweis" },
     { pattern: /^(?:this business account (?:has now registered|is now registered) as a standard account|dieser unternehmensaccount ist jetzt als standardaccount registriert)[.!]?$/iu, variant: "business-account-changed", title: "Unternehmensaccount geändert" },
     { pattern: /created (?:the |this )?group|gruppe(?:\s+.*?)?\s+erstellt/iu, variant: "group-created", title: "Gruppe erstellt" },
-    { pattern: /joined using (?:(?:this group's|an?|this) invite link|a group link)|joined (?:this group|the group) (?:with|using) (?:this |an )?invite link|(?:dieser|der) gruppe (?:mit|über) (?:den|diesen|einen) einladungslink beigetreten|über (?:diesen |einen )?einladungslink beigetreten/iu, variant: "participant-joined", title: "Per Einladungslink beigetreten" },
+    { pattern: /joined using (?:(?:this group's|an?|this) invite link|a group link)|joined (?:this group|the group) (?:with|using) (?:this |an )?invite link|(?:dieser|der) gruppe (?:mit|über) (?:den|diesen|einen) (?:gruppen-?|einladungs)link beigetreten|über (?:den |diesen |einen )?(?:gruppen-?|einladungs)link beigetreten/iu, variant: "participant-joined", title: "Per Einladungslink beigetreten" },
     { pattern: /joined (?:this|the) group|ist (?:dieser|der) gruppe beigetreten/iu, variant: "participant-joined", title: "Gruppe beigetreten" },
     { pattern: /^(?:(?:you|[^\n]{1,120}) changed (?:your|the|[^\n]{1,80}['’]s) member tag(?: from .{1,80})? to .{1,120}|(?:du|[^\n]{1,120}) (?:hast|hat) (?:deinen?|den|[^\n]{1,80}) mitglieds-?tag(?: von .{1,80})? (?:zu|in) .{1,120} geändert)[.!]?$/iu, variant: "member-tag-changed", title: "Mitglieds-Tag geändert" },
     { pattern: /^(?:(?:you|[^\n]{1,120}) removed (?:your|the|[^\n]{1,80}['’]s) member tag|(?:du|[^\n]{1,120}) (?:hast|hat) (?:deinen?|den|[^\n]{1,80}) mitglieds-?tag entfernt)[.!]?$/iu, variant: "member-tag-removed", title: "Mitglieds-Tag entfernt" },
@@ -708,7 +708,7 @@ function senderPrefixedSystemEventSemantic(text: string, sender: string): Messag
   );
   const germanActor = `(?:du|${regexEscape(sender)}|[^\\n]{1,120}?)`;
   const german = new RegExp(
-    `^${germanActor}\\s+(?:(?:hast|hat) (?:diese |die )?gruppe (?:erstellt|verlassen)|(?:hast|hat) (?:eine |die )?nachricht (?:angepinnt|losgelöst)|(?:bist|ist) (?:dieser|der) gruppe beigetreten|(?:bist|ist) kein(?:e|\\*e)? admin mehr|(?:hast|hat) .{1,160} (?:hinzugefügt|entfernt|zum admin gemacht)|(?:hast|hat) (?:den |diesen )?(?:gruppenname|gruppenbetreff|betreff|gruppenbeschreibung|gruppenbild|gruppen-einladungslink|einladungslink|gruppeneinstellungen) .{0,160}(?:geändert|zurückgesetzt|widerrufen|gelöscht)|(?:hast|hat) (?:ein |das )?ereignis .{0,120}erstellt|(?:hast|hat) (?:einen |den )?anruflink .{0,120}erstellt|(?:hast|hat) einen (?:video-?)?anruf gestartet|(?:hast|hat) die nachrichtendauer (?:aktualisiert|geändert)(?:[.!]?\\s+.{1,180})?|(?:hast|hat) eine neue telefonnummer(?:[.!]?\\s+.{1,180})?|(?:hast|hat) (?:selbstlöschende nachrichten|erweiterten chat-datenschutz) (?:aktiviert|deaktiviert)|(?:hast|hat) (?:diesen kontakt|dich) (?:blockiert|entblockiert|freigegeben))[.!]?$`,
+    `^${germanActor}\\s+(?:(?:hast|hat) (?:diese |die )?gruppe (?:erstellt|verlassen)|(?:hast|hat) (?:eine |die )?nachricht (?:angepinnt|losgelöst)|(?:bist|ist) (?:dieser|der) gruppe beigetreten|(?:bist|ist) über (?:den |diesen |einen )?(?:gruppen-?|einladungs)link beigetreten|(?:bist|ist) kein(?:e|\\*e)? admin mehr|(?:hast|hat) .{1,160} (?:hinzugefügt|entfernt|zum admin gemacht)|(?:hast|hat) (?:den |diesen )?(?:gruppenname|gruppenbetreff|betreff|gruppenbeschreibung|gruppenbild|gruppen-einladungslink|einladungslink|gruppeneinstellungen) .{0,160}(?:geändert|zurückgesetzt|widerrufen|gelöscht)|(?:hast|hat) (?:ein |das )?ereignis .{0,120}erstellt|(?:hast|hat) (?:einen |den )?anruflink .{0,120}erstellt|(?:hast|hat) einen (?:video-?)?anruf gestartet|(?:hast|hat) die nachrichtendauer (?:aktualisiert|geändert)(?:[.!]?\\s+.{1,180})?|(?:hast|hat) eine neue telefonnummer(?:[.!]?\\s+.{1,180})?|(?:hast|hat) (?:selbstlöschende nachrichten|erweiterten chat-datenschutz) (?:aktiviert|deaktiviert)|(?:hast|hat) (?:diesen kontakt|dich) (?:blockiert|entblockiert|freigegeben))[.!]?$`,
     "iu",
   );
   const security = /^(?:your security code with .+? changed|deine sicherheits(?:nummer|code)(?:\s+.*?)?\s+(?:hat sich geändert|wurde geändert))(?:[.!]\s*.*)?$/iu.test(clean);
@@ -930,11 +930,41 @@ function senderPrefixCounts(records: RawRecord[]): ReadonlyMap<string, number> {
   return counts;
 }
 
-function splitSender(rest: string, prefixCounts: ReadonlyMap<string, number>): { sender: string | null; text: string } {
+function splitSender(
+  rest: string,
+  prefixCounts: ReadonlyMap<string, number>,
+  continuation: readonly string[] = [],
+): { sender: string | null; text: string } {
   const candidates = senderCandidates(rest);
   if (!candidates.length) return { sender: null, text: rest };
   const repeated = candidates.filter(({ sender }) => (prefixCounts.get(sender) ?? 0) >= 2);
-  const selected = repeated.length ? repeated[repeated.length - 1] : candidates[0];
+  // A structured body label such as "Standort:" may itself occur repeatedly
+  // and must not become part of the sender. Prefer the split that preserves a
+  // specific semantic message type over one that degrades it to a generic URL.
+  // Otherwise keep the right-most repeated prefix so genuine names containing
+  // a colon (for example "ACME: Support") remain intact even when a shorter
+  // participant name is more common elsewhere in the group.
+  const specificity = ({ sender, text }: { sender: string; text: string }): number => {
+    // Some structured exports put the question/options on continuation lines.
+    // Include them when deciding whether a colon belongs to the sender or to a
+    // body label such as "Poll:".
+    const fullText = [text, ...continuation].join("\n");
+    const semantic = detectSemantic(fullText, sender);
+    if (!semantic) return 0;
+    const clean = markerText(fullText);
+    if (new RegExp(`^${regexEscape(semantic.title)}\\s*:`, "iu").test(clean)) return 3;
+    // Semantic titles are normalized for rendering (for example the English
+    // "Location" label becomes "Standort"). A leading structured label is
+    // therefore stronger evidence than comparing only the localized title.
+    if (!["link", "unsupported"].includes(semantic.type) && /^[^:\n]{1,80}:(?:\s|$)/u.test(clean)) return 3;
+    return ["link", "unsupported"].includes(semantic.type) ? 1 : 2;
+  };
+  const bestSpecificity = repeated.reduce((best, candidate) => Math.max(best, specificity(candidate)), 0);
+  const semanticCandidates = bestSpecificity >= 2
+    ? repeated.filter((candidate) => specificity(candidate) === bestSpecificity)
+    : [];
+  const selected = semanticCandidates[semanticCandidates.length - 1]
+    ?? (repeated.length ? repeated[repeated.length - 1] : candidates[0]);
   if (!selected) return { sender: null, text: rest };
   const sender = selected.sender;
   if (!sender || /^(?:https?|ftp)$/iu.test(sender)) return { sender: null, text: rest };
@@ -1114,7 +1144,7 @@ export function parseChat(text: string, requestedOrder: DateOrder = "auto"): Par
       && isCompleteSenderlessSystemPrefix(record.rest.slice(0, delimiter), semanticBeforeDelimiter);
     const split = safeSenderlessEvent
       ? { sender: null, text: record.rest }
-      : splitSender(record.rest, prefixCounts);
+      : splitSender(record.rest, prefixCounts, record.continuation);
     const { sender, text: firstLine } = split;
     const body = [firstLine, ...record.continuation].join("\n").replace(/\n+$/u, "");
     const decorations = extractDecorations(body);

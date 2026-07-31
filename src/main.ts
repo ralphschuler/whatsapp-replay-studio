@@ -1,5 +1,10 @@
 import "./style.css";
 import { DingPlayer } from "./audio";
+import {
+  estimateMp4SizeBytes,
+  prepareExportDestination,
+  type PreparedExportDestination,
+} from "./export-destination";
 import { exportReplayMp4, type ExportProgress } from "./exporter";
 import { chatTitleFromFilename, messageDirection, resolveSelfIdentity, SELF_NOT_IN_EXPORT } from "./identity";
 import { importWhatsAppExport, reparseProject } from "./importer";
@@ -73,6 +78,7 @@ let playbackStartTime = 0;
 let animationFrame = 0;
 let exportController: AbortController | null = null;
 let downloadUrl = "";
+let downloadCleanup: (() => Promise<void>) | null = null;
 let preparingPreview = false;
 let pendingPreviewRequest: { renderer: ChatCanvasRenderer; timeline: CompiledTimeline; time: number } | null = null;
 let mediaPreparationGeneration = 0;
@@ -239,8 +245,21 @@ function redraw(): void {
   renderer.render(timeline, currentTime, currentTheme());
   setText("current-time", formatDuration(currentTime));
   scrubber.value = String(currentTime);
+  // The preview and encoder share one bounded decoder working set. Do not let
+  // an asynchronous preview request evict media while an export frame or audio
+  // segment is using it.
+  if (exportController) return;
   pendingPreviewRequest = { renderer, timeline, time: currentTime };
   void flushPreviewRequests();
+}
+
+async function waitForPreviewIdle(signal?: AbortSignal): Promise<void> {
+  pendingPreviewRequest = null;
+  while (preparingPreview) {
+    if (signal?.aborted) throw new DOMException("Der Export wurde abgebrochen.", "AbortError");
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  }
+  if (signal?.aborted) throw new DOMException("Der Export wurde abgebrochen.", "AbortError");
 }
 
 function stopPlayback(): void {
@@ -497,8 +516,24 @@ function handleExportProgress(progress: ExportProgress): void {
   else setText("render-detail", "MP4 wird finalisiert …");
 }
 
+function exportFileName(): string {
+  const safeTitle = currentTheme().title
+    .replace(/[^\p{L}\p{N}]+/gu, "-")
+    .replace(/^-|-$/gu, "")
+    .toLowerCase() || "chat-replay";
+  return `${safeTitle}.mp4`;
+}
+
 async function startExport(): Promise<void> {
   if (!project || !mediaStore || !timeline.events.length || !selfSelect.value) return;
+  const preset = currentPreset();
+  const suggestedName = exportFileName();
+  // Keep this call before the first await: showSaveFilePicker requires the
+  // transient user activation from the export-button click.
+  const destinationPromise = prepareExportDestination({
+    estimatedBytes: estimateMp4SizeBytes(timeline.duration, preset.bitrate),
+    suggestedName,
+  });
   stopPlayback();
   exportController = new AbortController();
   setExportBusy(true);
@@ -508,38 +543,54 @@ async function startExport(): Promise<void> {
   setText("render-percent", "0 %");
   setText("render-title", "Video wird erstellt");
   setText("render-detail", "Medienlängen werden gelesen …");
+  let destination: PreparedExportDestination | null = null;
   try {
+    destination = await destinationPromise;
+    await waitForPreviewIdle(exportController.signal);
     const activeStore = mediaStore;
     const activeProject = project;
     await activeStore.preloadForMessages(selectedMessages(), (done, total) => {
       const progress = total ? done / total : 1;
       handleExportProgress({ phase: "prepare", progress: progress * 0.08, frame: done, totalFrames: total });
-    });
+    }, exportController.signal);
     if (mediaStore !== activeStore || project !== activeProject) throw new Error("Das Projekt wurde während der Vorbereitung gewechselt.");
     updateTimeline(false, true);
-    const blob = await exportReplayMp4({
+    const result = await exportReplayMp4({
       project: activeProject,
       timeline,
-      preset: currentPreset(),
+      preset,
       theme: currentTheme(),
       mediaStore: activeStore,
       incomingSound: incomingSoundInput.checked,
+      destination,
       signal: exportController.signal,
       onProgress: handleExportProgress,
     });
-    if (downloadUrl) URL.revokeObjectURL(downloadUrl);
-    downloadUrl = URL.createObjectURL(blob);
+    const { blob } = result;
+    const nextDownloadUrl = URL.createObjectURL(blob);
+    const previousDownloadUrl = downloadUrl;
+    const previousDownloadCleanup = downloadCleanup;
+    downloadUrl = nextDownloadUrl;
+    downloadCleanup = result.cleanup;
     downloadLink.href = downloadUrl;
-    const safeTitle = currentTheme().title.replace(/[^\p{L}\p{N}]+/gu, "-").replace(/^-|-$/gu, "").toLowerCase() || "chat-replay";
-    downloadLink.download = `${safeTitle}.mp4`;
-    setText("download-meta", `${currentPreset().label} · ${formatDuration(timeline.duration)} · ${(blob.size / 1024 / 1024).toLocaleString("de-DE", { maximumFractionDigits: 1 })} MB`);
+    downloadLink.download = suggestedName;
+    if (previousDownloadUrl) URL.revokeObjectURL(previousDownloadUrl);
+    await previousDownloadCleanup?.();
+    setText("download-meta", `${preset.label} · ${formatDuration(timeline.duration)} · ${(blob.size / 1024 / 1024).toLocaleString("de-DE", { maximumFractionDigits: 1 })} MB`);
     downloadCard.hidden = false;
     setText("render-title", "Fertig");
-    setText("render-detail", "Das MP4 kann jetzt heruntergeladen werden.");
+    setText(
+      "render-detail",
+      destination.kind === "file-system-access"
+        ? "Das MP4 wurde gespeichert und kann bei Bedarf erneut heruntergeladen werden."
+        : "Das MP4 kann jetzt heruntergeladen werden.",
+    );
     await new Promise((resolve) => setTimeout(resolve, 450));
     renderOverlay.hidden = true;
   } catch (error) {
+    if (destination?.kind === "opfs") await destination.cleanup();
     renderOverlay.hidden = true;
+    downloadCard.hidden = !downloadUrl;
     if (error instanceof DOMException && error.name === "AbortError") {
       setStatus("Der Videoexport wurde abgebrochen.", "info");
     } else {
@@ -549,6 +600,7 @@ async function startExport(): Promise<void> {
   } finally {
     exportController = null;
     setExportBusy(false);
+    redraw();
   }
 }
 
@@ -596,6 +648,12 @@ playButton.addEventListener("click", togglePlayback);
 scrubber.addEventListener("input", () => { stopPlayback(); currentTime = Number(scrubber.value); redraw(); });
 exportButton.addEventListener("click", () => void startExport());
 cancelExportButton.addEventListener("click", () => exportController?.abort());
+window.addEventListener("pagehide", (event) => {
+  if (event.persisted) return;
+  if (downloadUrl) URL.revokeObjectURL(downloadUrl);
+  void downloadCleanup?.();
+  mediaStore?.dispose();
+});
 
 applyCanvasPreset();
 setExportBusy(false);
