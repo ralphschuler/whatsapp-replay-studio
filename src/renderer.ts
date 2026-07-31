@@ -31,6 +31,29 @@ interface VideoDecoderEntry {
   exportFallback: boolean;
 }
 
+interface VideoMediaMetadata {
+  firstTimestamp: number;
+  duration: number;
+  width: number;
+  height: number;
+}
+
+interface AnimatedImageMetadata {
+  width: number;
+  height: number;
+  frameDurations: number[];
+  totalDuration: number;
+}
+
+interface StoredAudioMetadata extends AudioMediaInfo {
+  startOffset: number;
+}
+
+interface ExportVideoPlan {
+  events: { eventAt: number; duration: number }[];
+  fps: number;
+}
+
 interface AudioDecoderEntry extends AudioMediaInfo {
   input: Input<BlobSource>;
   sink: AudioBufferSink;
@@ -357,6 +380,29 @@ const AUDIO_SEGMENT_SECONDS = 8;
 const MAX_DECODABLE_MEDIA_BYTES = 750 * 1024 * 1024;
 const MAX_MEDIA_DIMENSION = 32_768;
 const MAX_MEDIA_PIXELS = 80_000_000;
+export const MAX_VISUAL_WORKING_SET_ITEMS = 12;
+export const MAX_VISUAL_WORKING_SET_PIXELS = 24_000_000;
+export const MIN_VISUAL_WORKING_SET_ITEMS = 4;
+export const MAX_CACHED_STATIC_IMAGE_PIXELS = 4_000_000;
+export const MAX_CACHED_STATIC_IMAGE_EDGE = 2_048;
+const MAX_AUDIO_DECODER_WORKING_SET_ITEMS = 4;
+
+export function cachedStaticImageDimensions(width: number, height: number): { width: number; height: number } {
+  if (width <= 0 || height <= 0) return { width, height };
+  const scale = Math.min(
+    1,
+    MAX_CACHED_STATIC_IMAGE_EDGE / Math.max(width, height),
+    Math.sqrt(MAX_CACHED_STATIC_IMAGE_PIXELS / (width * height)),
+  );
+  return {
+    width: Math.max(1, Math.round(width * scale)),
+    height: Math.max(1, Math.round(height * scale)),
+  };
+}
+
+function throwIfMediaPreparationAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new DOMException("Medienvorbereitung wurde abgebrochen.", "AbortError");
+}
 
 function assertSafeMediaDimensions(width: number, height: number): void {
   if (
@@ -599,18 +645,28 @@ export class AssetMediaStore {
   private readonly assets = new Map<string, ArchiveAsset>();
   private readonly images = new Map<string, DrawableImage>();
   private readonly animatedImages = new Map<string, AnimatedImageEntry>();
+  private readonly animatedMetadata = new Map<string, AnimatedImageMetadata>();
   private readonly contactCards = new Map<string, ContactCardInfo>();
   private readonly videos = new Map<string, VideoDecoderEntry>();
+  private readonly videoMetadata = new Map<string, VideoMediaMetadata>();
+  private readonly mediaDimensions = new Map<string, { width: number; height: number }>();
   private readonly audioDecoders = new Map<string, AudioDecoderEntry>();
-  private readonly audioMetadata = new Map<string, AudioMediaInfo>();
+  private readonly audioMetadata = new Map<string, StoredAudioMetadata>();
   private readonly audioLoading = new Map<string, Promise<AudioDecoderEntry | undefined>>();
   private readonly audioMetadataLoading = new Map<string, Promise<AudioMediaInfo | undefined>>();
+  private readonly metadataLoading = new Map<string, Promise<void>>();
   private readonly failedAudio = new Set<string>();
   private readonly noAudioTrack = new Set<string>();
   private readonly blobs = new Map<string, Promise<Blob>>();
   private readonly objectUrls = new Set<string>();
+  private readonly imageUrls = new Map<string, string>();
   private readonly failed = new Set<string>();
   private readonly loading = new Map<string, Promise<void>>();
+  private readonly visualAccess = new Map<string, number>();
+  private readonly audioAccess = new Map<string, number>();
+  private readonly activeAudioLoads = new Map<string, number>();
+  private readonly exportVideoPlans = new Map<string, ExportVideoPlan>();
+  private accessSequence = 0;
   private disposed = false;
 
   constructor(project: ImportedProject) {
@@ -618,23 +674,29 @@ export class AssetMediaStore {
   }
 
   getImage(path: string): DrawableImage | undefined {
-    return this.images.get(path);
+    const image = this.images.get(path);
+    if (image) this.touchVisual(path);
+    return image;
   }
 
   getVideoFrame(path: string): VideoSample | null | undefined {
-    return this.videos.get(path)?.frame;
+    const video = this.videos.get(path);
+    if (video) this.touchVisual(path);
+    return video?.frame;
   }
 
   getVideoDuration(path: string): number | undefined {
-    return this.videos.get(path)?.duration;
+    return this.videos.get(path)?.duration ?? this.videoMetadata.get(path)?.duration;
   }
 
   getAnimatedFrame(path: string): VideoFrame | undefined {
-    return this.animatedImages.get(path)?.frame ?? undefined;
+    const animated = this.animatedImages.get(path);
+    if (animated) this.touchVisual(path);
+    return animated?.frame ?? undefined;
   }
 
   isAnimatedImage(path: string): boolean {
-    return this.animatedImages.has(path);
+    return this.animatedImages.has(path) || this.animatedMetadata.has(path);
   }
 
   getAudioInfo(path: string): AudioMediaInfo | undefined {
@@ -647,28 +709,32 @@ export class AssetMediaStore {
   }
 
   getPlaybackDuration(path: string): number | undefined {
-    const video = this.videos.get(path);
-    const audio = this.audioDecoders.get(path);
-    if (video) return combinedPlaybackDuration(video.duration, audio?.duration, audio?.startOffset);
-    return audio?.duration ?? this.audioMetadata.get(path)?.duration ?? this.animatedImages.get(path)?.totalDuration;
+    const videoDuration = this.videos.get(path)?.duration ?? this.videoMetadata.get(path)?.duration;
+    const audio = this.audioDecoders.get(path) ?? this.audioMetadata.get(path);
+    if (videoDuration !== undefined) return combinedPlaybackDuration(videoDuration, audio?.duration, audio?.startOffset);
+    return audio?.duration ?? this.animatedImages.get(path)?.totalDuration ?? this.animatedMetadata.get(path)?.totalDuration;
   }
 
   getAudioTiming(path: string): { duration: number; startOffset: number } | undefined {
     const decoder = this.audioDecoders.get(path);
     if (decoder) return { duration: decoder.duration, startOffset: decoder.startOffset };
     const metadata = this.audioMetadata.get(path);
-    return metadata ? { duration: metadata.duration, startOffset: 0 } : undefined;
+    return metadata ? { duration: metadata.duration, startOffset: metadata.startOffset } : undefined;
   }
 
   getKnownMediaDurations(): ReadonlyMap<string, number> {
     const durations = new Map<string, number>();
+    for (const [path, entry] of this.animatedMetadata) durations.set(path, entry.totalDuration);
     for (const [path, entry] of this.animatedImages) durations.set(path, entry.totalDuration);
+    for (const [path, entry] of this.videoMetadata) durations.set(path, entry.duration);
     for (const [path, entry] of this.videos) durations.set(path, entry.duration);
-    for (const [path, entry] of this.audioMetadata) {
-      if (!durations.has(path)) durations.set(path, entry.duration);
-    }
     for (const [path, entry] of this.audioDecoders) {
-      const videoDuration = this.videos.get(path)?.duration;
+      const videoDuration = this.videos.get(path)?.duration ?? this.videoMetadata.get(path)?.duration;
+      const duration = combinedPlaybackDuration(videoDuration, entry.duration, entry.startOffset);
+      if (duration !== undefined) durations.set(path, duration);
+    }
+    for (const [path, entry] of this.audioMetadata) {
+      const videoDuration = this.videos.get(path)?.duration ?? this.videoMetadata.get(path)?.duration;
       const duration = combinedPlaybackDuration(videoDuration, entry.duration, entry.startOffset);
       if (duration !== undefined) durations.set(path, duration);
     }
@@ -676,16 +742,104 @@ export class AssetMediaStore {
   }
 
   getMediaDimensions(path: string): { width: number; height: number } | undefined {
-    const video = this.videos.get(path);
-    if (video) return { width: video.width, height: video.height };
-    const animated = this.animatedImages.get(path);
-    if (animated) return { width: animated.width, height: animated.height };
+    return this.mediaDimensions.get(path);
+  }
+
+  /**
+   * Keeps only the most recent visual attachments that can plausibly be on the
+   * canvas. Metadata is intentionally not evicted, so layout and full media
+   * durations remain stable while decoded pixels and container decoders stay
+   * within a small working set.
+   */
+  async prepareVisualWorkingSet(paths: string[]): Promise<ReadonlySet<string>> {
+    if (this.disposed) return new Set();
+    const selected = new Set<string>();
+    let pixels = 0;
+    for (let index = paths.length - 1; index >= 0 && selected.size < MAX_VISUAL_WORKING_SET_ITEMS; index -= 1) {
+      const path = paths[index];
+      if (!path || selected.has(path)) continue;
+      const asset = this.assets.get(path);
+      if (!asset || !["image", "sticker", "video"].includes(asset.kind)) continue;
+      const itemPixels = this.cachedVisualPixelCost(path, asset);
+      if (selected.size >= MIN_VISUAL_WORKING_SET_ITEMS && pixels + itemPixels > MAX_VISUAL_WORKING_SET_PIXELS) continue;
+      selected.add(path);
+      pixels += itemPixels;
+    }
+    this.releaseVisualsExcept(selected);
+    // Decode sequentially. Promise.all over a media-heavy export can briefly
+    // materialize every source image before the cache has a chance to evict.
+    for (const path of [...selected].reverse()) {
+      await this.load(path);
+      this.touchVisual(path);
+    }
+    this.releaseVisualsExcept(selected);
+    return selected;
+  }
+
+  private cachedVisualPixelCost(path: string, asset: ArchiveAsset): number {
+    const dimensions = this.mediaDimensions.get(path);
+    if (!dimensions) return 2_000_000;
+    if (["image", "sticker"].includes(asset.kind) && !this.animatedMetadata.has(path)) {
+      const cached = cachedStaticImageDimensions(dimensions.width, dimensions.height);
+      return cached.width * cached.height;
+    }
+    return dimensions.width * dimensions.height;
+  }
+
+  private touchVisual(path: string): void {
+    this.visualAccess.set(path, ++this.accessSequence);
+  }
+
+  private touchAudio(path: string): void {
+    this.audioAccess.set(path, ++this.accessSequence);
+  }
+
+  private releaseVisualsExcept(keep: ReadonlySet<string>): void {
+    for (const path of new Set([...this.images.keys(), ...this.animatedImages.keys(), ...this.videos.keys()])) {
+      if (!keep.has(path)) this.releaseVisual(path);
+    }
+  }
+
+  private releaseVisual(path: string): void {
     const image = this.images.get(path);
-    if (!image) return undefined;
-    return {
-      width: "naturalWidth" in image ? image.naturalWidth : image.width,
-      height: "naturalHeight" in image ? image.naturalHeight : image.height,
-    };
+    if (image && "close" in image && typeof image.close === "function") image.close();
+    this.images.delete(path);
+    const imageUrl = this.imageUrls.get(path);
+    if (imageUrl) {
+      URL.revokeObjectURL(imageUrl);
+      this.imageUrls.delete(path);
+      this.objectUrls.delete(imageUrl);
+    }
+    const animated = this.animatedImages.get(path);
+    if (animated) {
+      animated.frame?.close();
+      animated.decoder.close();
+      this.animatedImages.delete(path);
+    }
+    const video = this.videos.get(path);
+    if (video) {
+      void video.exportIterator?.return();
+      video.frame?.close();
+      video.input.dispose();
+      this.videos.delete(path);
+      if (!this.audioDecoders.has(path)) this.blobs.delete(path);
+    }
+    this.visualAccess.delete(path);
+  }
+
+  private trimAudioWorkingSet(): void {
+    if (this.audioDecoders.size <= MAX_AUDIO_DECODER_WORKING_SET_ITEMS) return;
+    const candidates = [...this.audioDecoders.keys()]
+      .filter((path) => !this.activeAudioLoads.has(path))
+      .sort((left, right) => (this.audioAccess.get(left) ?? 0) - (this.audioAccess.get(right) ?? 0));
+    while (this.audioDecoders.size > MAX_AUDIO_DECODER_WORKING_SET_ITEMS) {
+      const path = candidates.shift();
+      if (!path) break;
+      this.audioDecoders.get(path)?.input.dispose();
+      this.audioDecoders.delete(path);
+      this.audioAccess.delete(path);
+      if (!this.videos.has(path)) this.blobs.delete(path);
+    }
   }
 
   getScheduledAudioAssets(timeline: CompiledTimeline): ScheduledAudioAsset[] {
@@ -729,20 +883,24 @@ export class AssetMediaStore {
       const attachment = message.attachment;
       if (attachment?.status !== "found") continue;
       const label = attachment.displayName.replace(/[\u200E\u200F\u202A-\u202E\u2066-\u2069]/gu, "");
-      if (attachment.kind === "video" && !this.videos.has(attachment.archivePath)) {
+      if (attachment.kind === "video" && !this.videoMetadata.has(attachment.archivePath)) {
         issues.add(`Videospur „${label}“ kann nicht dekodiert werden.`);
       } else if (attachment.kind === "video" && this.failedAudio.has(attachment.archivePath) && !this.noAudioTrack.has(attachment.archivePath)) {
         issues.add(`Tonspur von „${label}“ kann nicht dekodiert werden.`);
       } else if (attachment.kind === "audio" && (this.failedAudio.has(attachment.archivePath) || !this.audioMetadata.has(attachment.archivePath))) {
         issues.add(`Audiodatei „${label}“ kann nicht dekodiert werden.`);
-      } else if (["image", "sticker"].includes(attachment.kind) && !this.images.has(attachment.archivePath) && !this.animatedImages.has(attachment.archivePath)) {
+      } else if (["image", "sticker"].includes(attachment.kind) && !this.mediaDimensions.has(attachment.archivePath)) {
         issues.add(`Bild „${label}“ kann nicht angezeigt werden.`);
       }
     }
     return [...issues];
   }
 
-  async preloadForMessages(messages: ChatMessage[], onProgress?: (done: number, total: number) => void): Promise<void> {
+  async preloadForMessages(
+    messages: ChatMessage[],
+    onProgress?: (done: number, total: number) => void,
+    signal?: AbortSignal,
+  ): Promise<void> {
     const paths = [...new Set(messages
       .filter((message) => message.attachment?.status === "found" && (
         ["image", "sticker", "video", "audio"].includes(message.attachment.kind)
@@ -751,17 +909,120 @@ export class AssetMediaStore {
       .map((message) => message.attachment?.archivePath)
       .filter((path): path is string => Boolean(path)))];
     let done = 0;
+    // A preflight reads metadata only. Any preview working set is released so
+    // importing or exporting a large archive cannot retain every decoded item.
+    this.releaseVisualsExcept(new Set());
+    throwIfMediaPreparationAborted(signal);
     for (const path of paths) {
+      throwIfMediaPreparationAborted(signal);
       const asset = this.assets.get(path);
       if (asset?.kind === "audio") await this.probeAudioMetadata(path);
-      else {
-        await this.load(path);
-        // Some .3gp/.mkv exports contain only an audio track. Probe it even if
-        // the visual track is absent or uses a codec the browser cannot decode.
-        if (asset?.kind === "video") await this.ensureAudioDecoder(path);
-      }
+      else if (asset?.kind === "video") await this.probeVideoMetadata(asset);
+      else if (asset && ["image", "sticker"].includes(asset.kind)) await this.probeImageMetadata(asset);
+      else await this.load(path);
+      throwIfMediaPreparationAborted(signal);
       done += 1;
       onProgress?.(done, paths.length);
+    }
+  }
+
+  private async probeImageMetadata(asset: ArchiveAsset): Promise<void> {
+    if (this.mediaDimensions.has(asset.path) || this.failed.has(asset.path) || this.disposed) return;
+    const active = this.metadataLoading.get(asset.path);
+    if (active) return active;
+    const pending = (async () => {
+      try {
+        const blob = await asset.loadBlob();
+        if (["image/gif", "image/webp"].includes(asset.mimeType) || /\.(?:gif|webp)$/iu.test(asset.basename)) {
+          try {
+            const metadata = await this.inspectAnimatedImage(asset, blob);
+            if (this.disposed) return;
+            this.animatedMetadata.set(asset.path, metadata);
+            this.mediaDimensions.set(asset.path, { width: metadata.width, height: metadata.height });
+            return;
+          } catch {
+            // A single-frame WebP or a browser without ImageDecoder still has
+            // a valid static representation, which is probed below.
+          }
+        }
+        const dimensions = await this.readStaticImageDimensions(blob);
+        if (!this.disposed) this.mediaDimensions.set(asset.path, dimensions);
+      } catch {
+        this.failed.add(asset.path);
+      }
+    })().finally(() => this.metadataLoading.delete(asset.path));
+    this.metadataLoading.set(asset.path, pending);
+    return pending;
+  }
+
+  private async inspectAnimatedImage(asset: ArchiveAsset, blob: Blob): Promise<AnimatedImageMetadata> {
+    const type = asset.mimeType === "image/webp" || /\.webp$/iu.test(asset.basename) ? "image/webp" : "image/gif";
+    if (typeof ImageDecoder === "undefined" || !await ImageDecoder.isTypeSupported(type)) {
+      throw new Error("Animierte Bilder werden von diesem Browser nicht dekodiert");
+    }
+    const decoder = new ImageDecoder({ data: await blob.arrayBuffer(), type, preferAnimation: true });
+    try {
+      await decoder.tracks.ready;
+      const track = decoder.tracks.selectedTrack;
+      if (!track || track.frameCount < 1) throw new Error("GIF enthält keine Frames");
+      if (type === "image/webp" && track.frameCount < 2) throw new Error("WebP ist nicht animiert");
+      if (!isSafeAnimatedImageCycle(track.frameCount, 0, 0)) throw new Error("Animation überschreitet die sichere Frame-Grenze");
+      const frameDurations: number[] = [];
+      let totalDuration = 0;
+      let decodedPixels = 0;
+      let width = 0;
+      let height = 0;
+      for (let frameIndex = 0; frameIndex < track.frameCount; frameIndex += 1) {
+        const result = await decoder.decode({ frameIndex, completeFramesOnly: true });
+        try {
+          assertSafeMediaDimensions(result.image.displayWidth, result.image.displayHeight);
+          width ||= result.image.displayWidth;
+          height ||= result.image.displayHeight;
+          const duration = Math.max(0.02, (result.image.duration ?? 100_000) / 1_000_000);
+          const nextDuration = totalDuration + duration;
+          const nextDecodedPixels = decodedPixels + result.image.displayWidth * result.image.displayHeight;
+          if (!isSafeAnimatedImageCycle(track.frameCount, nextDecodedPixels, nextDuration)) {
+            throw new Error("Animation überschreitet die sichere Dekodiergrenze");
+          }
+          frameDurations.push(duration);
+          totalDuration = nextDuration;
+          decodedPixels = nextDecodedPixels;
+        } finally {
+          result.image.close();
+        }
+      }
+      return { width, height, frameDurations, totalDuration };
+    } finally {
+      decoder.close();
+    }
+  }
+
+  private async readStaticImageDimensions(blob: Blob): Promise<{ width: number; height: number }> {
+    if (typeof createImageBitmap === "function") {
+      try {
+        const bitmap = await createImageBitmap(blob, { imageOrientation: "from-image" });
+        try {
+          assertSafeMediaDimensions(bitmap.width, bitmap.height);
+          return { width: bitmap.width, height: bitmap.height };
+        } finally {
+          bitmap.close();
+        }
+      } catch {
+        // Some formats are supported by <img> even when createImageBitmap rejects them.
+      }
+    }
+    const url = URL.createObjectURL(blob);
+    const image = new Image();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        image.onload = () => resolve();
+        image.onerror = () => reject(new Error("Bild konnte nicht geladen werden"));
+        image.src = url;
+      });
+      assertSafeMediaDimensions(image.naturalWidth, image.naturalHeight);
+      return { width: image.naturalWidth, height: image.naturalHeight };
+    } finally {
+      URL.revokeObjectURL(url);
     }
   }
 
@@ -800,6 +1061,10 @@ export class AssetMediaStore {
         await this.ensureAudioDecoder(asset.path);
         return;
       }
+      if (["image", "sticker"].includes(asset.kind) && !this.mediaDimensions.has(asset.path)) {
+        await this.probeImageMetadata(asset);
+        if (this.failed.has(asset.path)) return;
+      }
       const blob = await this.getBlob(asset);
       if (asset.kind === "document" && /\.(?:vcf|vcard)$/iu.test(asset.basename)) {
         const card = parseVCard(await blob.text());
@@ -828,14 +1093,34 @@ export class AssetMediaStore {
   private async loadStaticImage(path: string, blob: Blob): Promise<void> {
     if (typeof createImageBitmap === "function") {
       try {
-        const bitmap = await createImageBitmap(blob, { imageOrientation: "from-image" });
+        const intrinsic = this.mediaDimensions.get(path);
+        const cached = intrinsic ? cachedStaticImageDimensions(intrinsic.width, intrinsic.height) : undefined;
+        const options: ImageBitmapOptions = { imageOrientation: "from-image" };
+        if (intrinsic && cached && (cached.width !== intrinsic.width || cached.height !== intrinsic.height)) {
+          options.resizeWidth = cached.width;
+          options.resizeHeight = cached.height;
+          options.resizeQuality = "high";
+        }
+        let drawable: DrawableImage = await createImageBitmap(blob, options);
         try {
-          assertSafeMediaDimensions(bitmap.width, bitmap.height);
+          assertSafeMediaDimensions(drawable.width, drawable.height);
+          if (cached && (drawable.width > cached.width || drawable.height > cached.height)) {
+            const canvas = document.createElement("canvas");
+            canvas.width = cached.width;
+            canvas.height = cached.height;
+            const context = canvas.getContext("2d");
+            if (!context) throw new Error("Bild konnte nicht verkleinert werden");
+            context.drawImage(drawable, 0, 0, cached.width, cached.height);
+            if ("close" in drawable && typeof drawable.close === "function") drawable.close();
+            drawable = canvas;
+          }
         } catch (error) {
-          bitmap.close();
+          if ("close" in drawable && typeof drawable.close === "function") drawable.close();
           throw error;
         }
-        this.images.set(path, bitmap);
+        this.images.set(path, drawable);
+        if (!intrinsic) this.mediaDimensions.set(path, { width: drawable.width, height: drawable.height });
+        this.touchVisual(path);
         return;
       } catch {
         // Some formats are supported by <img> even when createImageBitmap rejects them.
@@ -854,8 +1139,26 @@ export class AssetMediaStore {
         image.src = url;
       });
       assertSafeMediaDimensions(image.naturalWidth, image.naturalHeight);
+      const intrinsic = this.mediaDimensions.get(path) ?? { width: image.naturalWidth, height: image.naturalHeight };
+      const cached = cachedStaticImageDimensions(intrinsic.width, intrinsic.height);
+      if (cached.width !== intrinsic.width || cached.height !== intrinsic.height) {
+        const canvas = document.createElement("canvas");
+        canvas.width = cached.width;
+        canvas.height = cached.height;
+        const context = canvas.getContext("2d");
+        if (!context) throw new Error("Bild konnte nicht verkleinert werden");
+        context.drawImage(image, 0, 0, cached.width, cached.height);
+        this.images.set(path, canvas);
+        if (!this.mediaDimensions.has(path)) this.mediaDimensions.set(path, intrinsic);
+        this.touchVisual(path);
+        URL.revokeObjectURL(url);
+        return;
+      }
       this.objectUrls.add(url);
+      this.imageUrls.set(path, url);
       this.images.set(path, image);
+      if (!this.mediaDimensions.has(path)) this.mediaDimensions.set(path, intrinsic);
+      this.touchVisual(path);
     } catch (error) {
       URL.revokeObjectURL(url);
       throw error;
@@ -865,14 +1168,34 @@ export class AssetMediaStore {
   private async loadStaticGifFallback(path: string, blob: Blob): Promise<void> {
     if (typeof createImageBitmap === "function") {
       try {
-        const bitmap = await createImageBitmap(blob);
+        const intrinsic = this.mediaDimensions.get(path);
+        const cached = intrinsic ? cachedStaticImageDimensions(intrinsic.width, intrinsic.height) : undefined;
+        const options: ImageBitmapOptions = {};
+        if (intrinsic && cached && (cached.width !== intrinsic.width || cached.height !== intrinsic.height)) {
+          options.resizeWidth = cached.width;
+          options.resizeHeight = cached.height;
+          options.resizeQuality = "high";
+        }
+        let drawable: DrawableImage = await createImageBitmap(blob, options);
         try {
-          assertSafeMediaDimensions(bitmap.width, bitmap.height);
+          assertSafeMediaDimensions(drawable.width, drawable.height);
+          if (cached && (drawable.width > cached.width || drawable.height > cached.height)) {
+            const canvas = document.createElement("canvas");
+            canvas.width = cached.width;
+            canvas.height = cached.height;
+            const context = canvas.getContext("2d");
+            if (!context) throw new Error("GIF konnte nicht verkleinert werden");
+            context.drawImage(drawable, 0, 0, cached.width, cached.height);
+            if ("close" in drawable && typeof drawable.close === "function") drawable.close();
+            drawable = canvas;
+          }
         } catch (error) {
-          bitmap.close();
+          if ("close" in drawable && typeof drawable.close === "function") drawable.close();
           throw error;
         }
-        this.images.set(path, bitmap);
+        this.images.set(path, drawable);
+        if (!intrinsic) this.mediaDimensions.set(path, { width: drawable.width, height: drawable.height });
+        this.touchVisual(path);
         return;
       } catch {
         // Some browsers expose createImageBitmap but cannot decode GIF files.
@@ -889,12 +1212,16 @@ export class AssetMediaStore {
       });
       assertSafeMediaDimensions(image.naturalWidth, image.naturalHeight);
       const canvas = document.createElement("canvas");
-      canvas.width = image.naturalWidth;
-      canvas.height = image.naturalHeight;
+      const intrinsic = this.mediaDimensions.get(path) ?? { width: image.naturalWidth, height: image.naturalHeight };
+      const cached = cachedStaticImageDimensions(intrinsic.width, intrinsic.height);
+      canvas.width = cached.width;
+      canvas.height = cached.height;
       const context = canvas.getContext("2d");
       if (!context) throw new Error("GIF-Fallback konnte nicht gerendert werden");
-      context.drawImage(image, 0, 0);
+      context.drawImage(image, 0, 0, cached.width, cached.height);
       this.images.set(path, canvas);
+      if (!this.mediaDimensions.has(path)) this.mediaDimensions.set(path, intrinsic);
+      this.touchVisual(path);
     } finally {
       URL.revokeObjectURL(url);
     }
@@ -905,6 +1232,12 @@ export class AssetMediaStore {
     if (typeof ImageDecoder === "undefined" || !await ImageDecoder.isTypeSupported(type)) {
       throw new Error("Animierte Bilder werden von diesem Browser nicht dekodiert");
     }
+    let metadata = this.animatedMetadata.get(asset.path);
+    if (!metadata) {
+      metadata = await this.inspectAnimatedImage(asset, blob);
+      this.animatedMetadata.set(asset.path, metadata);
+      this.mediaDimensions.set(asset.path, { width: metadata.width, height: metadata.height });
+    }
     const decoder = new ImageDecoder({
       data: await blob.arrayBuffer(),
       type,
@@ -914,46 +1247,22 @@ export class AssetMediaStore {
     try {
       await decoder.tracks.ready;
       const track = decoder.tracks.selectedTrack;
-      if (!track || track.frameCount < 1) throw new Error("GIF enthält keine Frames");
-      if (type === "image/webp" && track.frameCount < 2) throw new Error("WebP ist nicht animiert");
-      if (!isSafeAnimatedImageCycle(track.frameCount, 0, 0)) {
-        throw new Error("Animation überschreitet die sichere Frame-Grenze");
-      }
-      const frameDurations: number[] = [];
-      let totalDuration = 0;
-      let decodedPixels = 0;
-      for (let frameIndex = 0; frameIndex < track.frameCount; frameIndex += 1) {
-        const result = await decoder.decode({ frameIndex, completeFramesOnly: true });
-        try {
-          assertSafeMediaDimensions(result.image.displayWidth, result.image.displayHeight);
-          const duration = Math.max(0.02, (result.image.duration ?? 100_000) / 1_000_000);
-          const nextDuration = totalDuration + duration;
-          const nextDecodedPixels = decodedPixels + result.image.displayWidth * result.image.displayHeight;
-          if (!isSafeAnimatedImageCycle(track.frameCount, nextDecodedPixels, nextDuration)) {
-            throw new Error("Animation überschreitet die sichere Dekodiergrenze");
-          }
-          frameDurations.push(duration);
-          totalDuration = nextDuration;
-          decodedPixels = nextDecodedPixels;
-          if (!firstFrame) firstFrame = result.image;
-          else result.image.close();
-        } catch (error) {
-          if (result.image !== firstFrame) result.image.close();
-          throw error;
-        }
-      }
-      if (!firstFrame || frameDurations.length !== track.frameCount) throw new Error("GIF konnte nicht vollständig dekodiert werden");
+      if (!track || track.frameCount !== metadata.frameDurations.length) throw new Error("GIF-Frames haben sich nach der Prüfung geändert");
+      const result = await decoder.decode({ frameIndex: 0, completeFramesOnly: true });
+      firstFrame = result.image;
+      assertSafeMediaDimensions(firstFrame.displayWidth, firstFrame.displayHeight);
       this.animatedImages.set(asset.path, {
         decoder,
-        width: firstFrame.displayWidth,
-        height: firstFrame.displayHeight,
-        frameDurations,
-        totalDuration,
+        width: metadata.width,
+        height: metadata.height,
+        frameDurations: metadata.frameDurations,
+        totalDuration: metadata.totalDuration,
         frame: firstFrame,
         frameIndex: 0,
         pending: null,
       });
       firstFrame = null;
+      this.touchVisual(asset.path);
     } catch (error) {
       firstFrame?.close();
       decoder.close();
@@ -969,6 +1278,86 @@ export class AssetMediaStore {
       throw error;
     });
     this.blobs.set(asset.path, pending);
+    return pending;
+  }
+
+  private async probeVideoMetadata(asset: ArchiveAsset): Promise<void> {
+    if ((this.videoMetadata.has(asset.path) || this.failed.has(asset.path)) && (this.audioMetadata.has(asset.path) || this.noAudioTrack.has(asset.path) || this.failedAudio.has(asset.path))) return;
+    if (this.disposed || asset.size > MAX_DECODABLE_MEDIA_BYTES) {
+      this.failed.add(asset.path);
+      return;
+    }
+    const active = this.metadataLoading.get(asset.path);
+    if (active) return active;
+    const pending = (async () => {
+      let input: Input<BlobSource> | null = null;
+      try {
+        input = new Input({ source: new BlobSource(await asset.loadBlob()), formats: ALL_FORMATS });
+        if (!await input.canRead()) throw new Error("Videoformat nicht lesbar");
+        const [videoTrack, audioTrack] = await Promise.all([
+          input.getPrimaryVideoTrack(),
+          input.getPrimaryAudioTrack(),
+        ]);
+        let videoFirstTimestamp: number | undefined;
+        if (videoTrack) {
+          try {
+            if (!await videoTrack.canDecode()) throw new Error("Videocodec wird von diesem Browser nicht unterstützt");
+            videoFirstTimestamp = Math.max(0, await videoTrack.getFirstTimestamp());
+            let videoEndTimestamp = await videoTrack.getDurationFromMetadata();
+            try { videoEndTimestamp = await videoTrack.computeDuration(); } catch { /* Use container metadata as fallback. */ }
+            if (videoEndTimestamp === null) throw new Error("Videodauer konnte nicht bestimmt werden");
+            const [width, height] = await Promise.all([videoTrack.getDisplayWidth(), videoTrack.getDisplayHeight()]);
+            assertSafeMediaDimensions(width, height);
+            if (!this.disposed) {
+              const metadata = {
+                firstTimestamp: videoFirstTimestamp,
+                duration: Math.max(0.01, videoEndTimestamp - videoFirstTimestamp),
+                width,
+                height,
+              };
+              this.videoMetadata.set(asset.path, metadata);
+              this.mediaDimensions.set(asset.path, { width, height });
+              this.failed.delete(asset.path);
+            }
+          } catch {
+            this.failed.add(asset.path);
+          }
+        } else {
+          this.failed.add(asset.path);
+        }
+
+        if (audioTrack) {
+          try {
+            const canDecode = await audioTrack.canDecode();
+            const firstTimestamp = Math.max(0, await audioTrack.getFirstTimestamp());
+            let audioEndTimestamp = await audioTrack.getDurationFromMetadata();
+            try { audioEndTimestamp = await audioTrack.computeDuration(); } catch { /* Use container metadata as fallback. */ }
+            if (audioEndTimestamp === null) throw new Error("Audiodauer konnte nicht bestimmt werden");
+            if (!this.disposed) {
+              this.audioMetadata.set(asset.path, {
+                duration: Math.max(0.01, audioEndTimestamp - firstTimestamp),
+                peaks: placeholderWaveformPeaks(),
+                startOffset: videoFirstTimestamp === undefined ? 0 : firstTimestamp - videoFirstTimestamp,
+              });
+              this.noAudioTrack.delete(asset.path);
+              if (canDecode) this.failedAudio.delete(asset.path);
+              else this.failedAudio.add(asset.path);
+            }
+          } catch {
+            this.failedAudio.add(asset.path);
+          }
+        } else {
+          this.noAudioTrack.add(asset.path);
+          this.failedAudio.delete(asset.path);
+        }
+      } catch {
+        this.failed.add(asset.path);
+        this.failedAudio.add(asset.path);
+      } finally {
+        input?.dispose();
+      }
+    })().finally(() => this.metadataLoading.delete(asset.path));
+    this.metadataLoading.set(asset.path, pending);
     return pending;
   }
 
@@ -992,7 +1381,7 @@ export class AssetMediaStore {
         let endTimestamp = await track.getDurationFromMetadata();
         try { endTimestamp = await track.computeDuration(); } catch { /* Use container metadata as fallback. */ }
         if (endTimestamp === null) throw new Error("Audiodauer konnte nicht bestimmt werden");
-        const metadata = { duration: Math.max(0.01, endTimestamp - firstTimestamp), peaks: placeholderWaveformPeaks() };
+        const metadata = { duration: Math.max(0.01, endTimestamp - firstTimestamp), peaks: placeholderWaveformPeaks(), startOffset: 0 };
         if (this.disposed) return undefined;
         this.audioMetadata.set(path, metadata);
         if (!canDecode) this.failedAudio.add(path);
@@ -1010,7 +1399,10 @@ export class AssetMediaStore {
 
   private async ensureAudioDecoder(path: string): Promise<AudioDecoderEntry | undefined> {
     const cached = this.audioDecoders.get(path);
-    if (cached) return cached;
+    if (cached) {
+      this.touchAudio(path);
+      return cached;
+    }
     if (this.failedAudio.has(path) || this.noAudioTrack.has(path) || this.disposed) return undefined;
     const active = this.audioLoading.get(path);
     if (active) return active;
@@ -1046,7 +1438,7 @@ export class AssetMediaStore {
       try { endTimestamp = await track.computeDuration(); } catch { /* Use container metadata as fallback. */ }
       if (endTimestamp === null) throw new Error("Audiodauer konnte nicht bestimmt werden");
       const duration = Math.max(0.01, endTimestamp - firstTimestamp);
-      const videoFirstTimestamp = this.videos.get(asset.path)?.firstTimestamp;
+      const videoFirstTimestamp = this.videos.get(asset.path)?.firstTimestamp ?? this.videoMetadata.get(asset.path)?.firstTimestamp;
       const startOffset = videoFirstTimestamp === undefined ? 0 : firstTimestamp - videoFirstTimestamp;
       if (this.disposed) throw new Error("Medienspeicher wurde geschlossen");
       const entry: AudioDecoderEntry = {
@@ -1058,7 +1450,9 @@ export class AssetMediaStore {
         peaks: this.audioMetadata.get(asset.path)?.peaks ?? placeholderWaveformPeaks(),
       };
       this.audioDecoders.set(asset.path, entry);
-      this.audioMetadata.set(asset.path, { duration: entry.duration, peaks: entry.peaks });
+      this.audioMetadata.set(asset.path, { duration: entry.duration, peaks: entry.peaks, startOffset: entry.startOffset });
+      this.touchAudio(asset.path);
+      this.trimAudioWorkingSet();
       this.failedAudio.delete(asset.path);
       this.noAudioTrack.delete(asset.path);
       input = null;
@@ -1069,35 +1463,44 @@ export class AssetMediaStore {
   }
 
   async loadAudioSegment(path: string, start: number, requestedDuration = AUDIO_SEGMENT_SECONDS): Promise<PcmAudioClip | undefined> {
-    const entry = await this.ensureAudioDecoder(path);
-    if (!entry || this.disposed) return undefined;
-    const localStart = Math.max(0, Math.min(entry.duration, start));
-    const duration = Math.max(0, Math.min(requestedDuration, entry.duration - localStart));
-    if (duration <= 0) return undefined;
-    const capacity = Math.max(1, Math.ceil(duration * AUDIO_SAMPLE_RATE));
-    const left = new Float32Array(new ArrayBuffer(capacity * Float32Array.BYTES_PER_ELEMENT));
-    const right = new Float32Array(new ArrayBuffer(capacity * Float32Array.BYTES_PER_ELEMENT));
-    let decodedEnd = 0;
-    const absoluteStart = entry.firstTimestamp + localStart;
-    const absoluteEnd = absoluteStart + duration;
-    for await (const wrapped of entry.sink.buffers(absoluteStart, absoluteEnd)) {
-      if (this.disposed) return undefined;
-      const bufferStart = wrapped.timestamp - absoluteStart;
-      mixAudioBuffer(left, right, wrapped.buffer, bufferStart);
-      decodedEnd = Math.max(decodedEnd, Math.min(duration, bufferStart + wrapped.duration));
+    this.activeAudioLoads.set(path, (this.activeAudioLoads.get(path) ?? 0) + 1);
+    try {
+      const entry = await this.ensureAudioDecoder(path);
+      if (!entry || this.disposed) return undefined;
+      this.touchAudio(path);
+      const localStart = Math.max(0, Math.min(entry.duration, start));
+      const duration = Math.max(0, Math.min(requestedDuration, entry.duration - localStart));
+      if (duration <= 0) return undefined;
+      const capacity = Math.max(1, Math.ceil(duration * AUDIO_SAMPLE_RATE));
+      const left = new Float32Array(new ArrayBuffer(capacity * Float32Array.BYTES_PER_ELEMENT));
+      const right = new Float32Array(new ArrayBuffer(capacity * Float32Array.BYTES_PER_ELEMENT));
+      let decodedEnd = 0;
+      const absoluteStart = entry.firstTimestamp + localStart;
+      const absoluteEnd = absoluteStart + duration;
+      for await (const wrapped of entry.sink.buffers(absoluteStart, absoluteEnd)) {
+        if (this.disposed) return undefined;
+        const bufferStart = wrapped.timestamp - absoluteStart;
+        mixAudioBuffer(left, right, wrapped.buffer, bufferStart);
+        decodedEnd = Math.max(decodedEnd, Math.min(duration, bufferStart + wrapped.duration));
+      }
+      if (decodedEnd <= 0) throw new Error("Audiodatei enthält keine dekodierbaren Samples");
+      if (decodedEnd + 0.08 < duration) {
+        throw new Error("Audiodatei konnte nicht bis zum Ende des Segments dekodiert werden");
+      }
+      const peaks = waveformPeaks(left, right);
+      return {
+        duration,
+        sampleRate: AUDIO_SAMPLE_RATE,
+        left,
+        right,
+        peaks,
+      };
+    } finally {
+      const remaining = (this.activeAudioLoads.get(path) ?? 1) - 1;
+      if (remaining > 0) this.activeAudioLoads.set(path, remaining);
+      else this.activeAudioLoads.delete(path);
+      this.trimAudioWorkingSet();
     }
-    if (decodedEnd <= 0) throw new Error("Audiodatei enthält keine dekodierbaren Samples");
-    if (decodedEnd + 0.08 < duration) {
-      throw new Error("Audiodatei konnte nicht bis zum Ende des Segments dekodiert werden");
-    }
-    const peaks = waveformPeaks(left, right);
-    return {
-      duration,
-      sampleRate: AUDIO_SAMPLE_RATE,
-      left,
-      right,
-      peaks,
-    };
   }
 
   private async loadVideo(asset: ArchiveAsset): Promise<void> {
@@ -1132,7 +1535,12 @@ export class AssetMediaStore {
         exportFallback: false,
       };
       this.videos.set(asset.path, entry);
-      await this.prepareVideoFrame(asset.path, 0, true);
+      this.videoMetadata.set(asset.path, { firstTimestamp, duration: entry.duration, width, height });
+      this.mediaDimensions.set(asset.path, { width, height });
+      this.failed.delete(asset.path);
+      this.touchVisual(asset.path);
+      await this.configureVideoForExport(asset.path, entry);
+      input = null;
     } catch (error) {
       this.videos.delete(asset.path);
       input?.dispose();
@@ -1145,6 +1553,7 @@ export class AssetMediaStore {
     if (!this.videos.has(path) && !this.failed.has(path)) await this.load(path);
     const entry = this.videos.get(path);
     if (!entry) return;
+    this.touchVisual(path);
     const requested = exact ? time : Math.floor(time * 15) / 15;
     const target = Math.min(Math.max(0, entry.duration - 0.001), Math.max(0, requested));
     if (Math.abs(entry.frameTime - target) < 0.001) return;
@@ -1200,8 +1609,10 @@ export class AssetMediaStore {
   }
 
   async prepareAnimatedFrame(path: string, time: number, exact = false): Promise<void> {
+    if (!this.animatedImages.has(path) && !this.failed.has(path)) await this.load(path);
     const entry = this.animatedImages.get(path);
     if (!entry) return;
+    this.touchVisual(path);
     const target = exact ? time : Math.floor(time * 15) / 15;
     const nextIndex = animatedFrameIndex(entry.frameDurations, target, entry.totalDuration);
     if (entry.frameIndex === nextIndex && entry.frame) return;
@@ -1239,33 +1650,41 @@ export class AssetMediaStore {
     for (const event of timeline.events) {
       const attachment = event.message.attachment;
       if (attachment?.status !== "found" || attachment.kind !== "video") continue;
-      const entry = this.videos.get(attachment.archivePath);
-      if (!entry) continue;
+      const duration = this.getVideoDuration(attachment.archivePath);
+      if (duration === undefined) continue;
       const items = byPath.get(attachment.archivePath) ?? [];
-      items.push({ eventAt: event.at, duration: Math.min(event.mediaDuration ?? entry.duration, entry.duration) });
+      items.push({ eventAt: event.at, duration: Math.min(event.mediaDuration ?? duration, duration) });
       byPath.set(attachment.archivePath, items);
     }
-    for (const [path, events] of byPath) {
-      const entry = this.videos.get(path);
-      if (!entry) continue;
-      entry.frame?.close();
-      entry.frame = null;
-      entry.frameTime = -1;
-      entry.exportCursor = 0;
-      entry.exportFallback = events.length > 1;
-      if (entry.exportFallback) continue;
-      const event = events[0];
-      if (!event) continue;
-      const times: number[] = [];
-      const firstFrame = Math.ceil(event.eventAt * fps);
-      const lastFrame = Math.floor((event.eventAt + event.duration) * fps);
-      for (let frame = firstFrame; frame <= lastFrame; frame += 1) {
-        const localTime = Math.min(event.duration - 0.001, Math.max(0, frame / fps - event.eventAt));
-        if (localTime >= 0 && (times.length === 0 || Math.abs((times[times.length - 1] ?? -1) - localTime) > 0.0005)) times.push(localTime);
-      }
-      entry.exportTimes = times;
-      entry.exportIterator = entry.sink.samplesAtTimestamps(times.map((time) => entry.firstTimestamp + time));
+    this.exportVideoPlans.clear();
+    for (const [path, events] of byPath) this.exportVideoPlans.set(path, { events, fps });
+    await Promise.all([...this.videos].map(([path, entry]) => this.configureVideoForExport(path, entry)));
+  }
+
+  private async configureVideoForExport(path: string, entry: VideoDecoderEntry): Promise<void> {
+    if (entry.exportIterator) await entry.exportIterator.return();
+    entry.frame?.close();
+    entry.frame = null;
+    entry.frameTime = -1;
+    entry.exportTimes = [];
+    entry.exportCursor = 0;
+    entry.exportFallback = false;
+    entry.exportIterator = null;
+    const plan = this.exportVideoPlans.get(path);
+    if (!plan) return;
+    entry.exportFallback = plan.events.length > 1;
+    if (entry.exportFallback) return;
+    const event = plan.events[0];
+    if (!event) return;
+    const times: number[] = [];
+    const firstFrame = Math.ceil(event.eventAt * plan.fps);
+    const lastFrame = Math.floor((event.eventAt + event.duration) * plan.fps);
+    for (let frame = firstFrame; frame <= lastFrame; frame += 1) {
+      const localTime = Math.min(event.duration - 0.001, Math.max(0, frame / plan.fps - event.eventAt));
+      if (localTime >= 0 && (times.length === 0 || Math.abs((times[times.length - 1] ?? -1) - localTime) > 0.0005)) times.push(localTime);
     }
+    entry.exportTimes = times;
+    entry.exportIterator = entry.sink.samplesAtTimestamps(times.map((time) => entry.firstTimestamp + time));
   }
 
   async endExportSession(): Promise<void> {
@@ -1276,6 +1695,7 @@ export class AssetMediaStore {
       entry.exportCursor = 0;
       entry.exportFallback = false;
     }
+    this.exportVideoPlans.clear();
   }
 
   private releaseResources(): void {
@@ -1295,16 +1715,27 @@ export class AssetMediaStore {
     for (const url of this.objectUrls) URL.revokeObjectURL(url);
     this.images.clear();
     this.animatedImages.clear();
+    this.animatedMetadata.clear();
     this.contactCards.clear();
     this.videos.clear();
+    this.videoMetadata.clear();
+    this.mediaDimensions.clear();
     this.audioDecoders.clear();
     this.audioMetadata.clear();
     this.audioLoading.clear();
     this.audioMetadataLoading.clear();
+    this.metadataLoading.clear();
     this.failedAudio.clear();
     this.noAudioTrack.clear();
     this.blobs.clear();
     this.objectUrls.clear();
+    this.imageUrls.clear();
+    this.failed.clear();
+    this.loading.clear();
+    this.visualAccess.clear();
+    this.audioAccess.clear();
+    this.activeAudioLoads.clear();
+    this.exportVideoPlans.clear();
   }
 
   dispose(): void {
@@ -1368,10 +1799,17 @@ export class ChatCanvasRenderer {
   async prepareFrame(timeline: CompiledTimeline, time: number, exact = false): Promise<void> {
     const visibleCount = visibleEventCount(timeline, time);
     const events = timeline.events.slice(Math.max(0, visibleCount - 90), visibleCount);
+    const visualPaths = events.flatMap((event) => {
+      const attachment = event.message.attachment;
+      return attachment?.status === "found" && ["image", "sticker", "video"].includes(attachment.kind)
+        ? [attachment.archivePath]
+        : [];
+    });
+    const workingSet = await this.media.prepareVisualWorkingSet(visualPaths);
     const promises: Promise<void>[] = [];
     for (const event of events) {
       const attachment = event.message.attachment;
-      if (attachment?.status !== "found") continue;
+      if (attachment?.status !== "found" || !workingSet.has(attachment.archivePath)) continue;
       if (attachment.kind === "video") {
         const duration = Math.min(
           event.mediaDuration ?? this.media.getVideoDuration(attachment.archivePath) ?? 0,
