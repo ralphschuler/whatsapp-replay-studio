@@ -41,9 +41,10 @@ Die gebaute Datei `dist/index.html` ist vollständig eigenständig. Sie kann per
 npm install
 npm run test
 npm run build
+npm run test:e2e
 ```
 
-Voraussetzung ist Node.js 20 oder neuer. Der Build bündelt alle Abhängigkeiten in eine einzelne `dist/index.html`.
+Voraussetzung sind Node.js 20 oder neuer und eine installierte aktuelle Google-Chrome-Version. Der Build bündelt alle Abhängigkeiten in eine einzelne `dist/index.html`. Der E2E-Test startet diesen Produktions-Build lokal, lädt im echten Browser einen kleinen WhatsApp-ZIP-Export mit Bild und Ton, prüft Play sowie Zeitfortschritt und validiert anschließend das vollständig erzeugte MP4.
 
 ## Nachrichtentypen
 
@@ -58,7 +59,7 @@ Voraussetzung ist Node.js 20 oder neuer. Der Build bündelt alle Abhängigkeiten
 
 ## GitHub Pages
 
-Der Workflow `.github/workflows/deploy-pages.yml` führt bei jedem Push auf `main` zuerst Tests und Build aus und veröffentlicht anschließend `dist/` über GitHub Pages. Er kann außerdem über **Actions → Deploy GitHub Pages → Run workflow** manuell gestartet werden.
+Der Workflow `.github/workflows/deploy-pages.yml` führt bei jedem Push auf `main` zuerst Unit-Tests, Build und den vollständigen Chrome-E2E-Export aus. Erst wenn auch der heruntergeladene MP4-Container validiert wurde, veröffentlicht er `dist/` über GitHub Pages. Bei einem Fehler werden Playwright-Trace, Screenshot und Video als Workflow-Artefakt aufbewahrt. Der Workflow kann außerdem über **Actions → Deploy GitHub Pages → Run workflow** manuell gestartet werden.
 
 Bei der ersten Einrichtung muss unter **Settings → Pages → Build and deployment → Source** einmalig **GitHub Actions** ausgewählt sein.
 

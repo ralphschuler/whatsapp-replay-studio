@@ -1,7 +1,9 @@
 // @vitest-environment happy-dom
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import JSZip from "jszip";
 import { beforeAll, describe, expect, it, vi } from "vitest";
+import { AssetMediaStore } from "../src/renderer";
 
 function canvasContextStub(): CanvasRenderingContext2D {
   const methods = new Set([
@@ -107,7 +109,75 @@ describe("application flow", () => {
     await vi.waitFor(() => expect(document.getElementById("stat-messages")?.textContent).toBe("3"));
     expect(selfSelect.value).toBe("");
     expect(selfSelect.getAttribute("aria-invalid")).toBe("true");
-    expect((document.getElementById("play-button") as HTMLButtonElement).disabled).toBe(true);
+    expect((document.getElementById("play-button") as HTMLButtonElement).disabled).toBe(false);
     expect((document.getElementById("export-button") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("keeps preview and export available when background media preparation fails", async () => {
+    const preload = vi.spyOn(AssetMediaStore.prototype, "preloadForMessages")
+      .mockRejectedValueOnce(new Error("probe failed"));
+    try {
+      const file = new File([
+        "20.07.26, 09:03 - Mia: Eingehend\n20.07.26, 09:04 - Ralph: Ausgehend",
+      ], "WhatsApp Chat - Mia.txt", { type: "text/plain" });
+      const fileInput = document.getElementById("file-input") as HTMLInputElement;
+      Object.defineProperty(fileInput, "files", { configurable: true, value: [file] });
+      fileInput.dispatchEvent(new Event("change"));
+
+      await vi.waitFor(() => {
+        expect(document.getElementById("diagnostic")?.textContent).toContain("probe failed");
+      });
+      expect((document.getElementById("self-name") as HTMLSelectElement).value).toBe("Ralph");
+      expect((document.getElementById("play-button") as HTMLButtonElement).disabled).toBe(false);
+      expect((document.getElementById("export-button") as HTMLButtonElement).disabled).toBe(false);
+    } finally {
+      preload.mockRestore();
+    }
+  });
+
+  it("starts playback before a large archive media preflight finishes", async () => {
+    vi.stubGlobal("AudioContext", class {
+      readonly state = "running";
+      readonly sampleRate = 48_000;
+      async resume(): Promise<void> {}
+      createBuffer(): { copyToChannel: () => void } {
+        return { copyToChannel: () => undefined };
+      }
+    });
+    let finishPreload: (() => void) | undefined;
+    const pendingPreload = new Promise<void>((resolvePreload) => { finishPreload = resolvePreload; });
+    const preload = vi.spyOn(AssetMediaStore.prototype, "preloadForMessages")
+      .mockImplementation(() => pendingPreload);
+    try {
+      const zip = new JSZip();
+      zip.file("_chat.txt", [
+        "[20.07.26, 09:03:00] Mia: <Anhang: photo.jpg>",
+        "[20.07.26, 09:04:00] Ralph: Die Medienprüfung läuft noch.",
+      ].join("\n"));
+      zip.file("photo.jpg", new Uint8Array([0xff, 0xd8, 0xff, 0xd9]));
+      const archive = await zip.generateAsync({ type: "arraybuffer" });
+      const file = new File([archive], "Gruppenchat.zip", { type: "application/zip" });
+      const fileInput = document.getElementById("file-input") as HTMLInputElement;
+      Object.defineProperty(fileInput, "files", { configurable: true, value: [file] });
+      fileInput.dispatchEvent(new Event("change"));
+
+      const play = document.getElementById("play-button") as HTMLButtonElement;
+      const selfSelect = document.getElementById("self-name") as HTMLSelectElement;
+      await vi.waitFor(() => expect(preload).toHaveBeenCalledOnce());
+
+      expect(selfSelect.value).toBe("");
+      expect(play.disabled).toBe(false);
+      expect((document.getElementById("export-button") as HTMLButtonElement).disabled).toBe(true);
+      expect(document.getElementById("import-status")?.textContent).toContain("Vorschau kann sofort starten");
+
+      play.click();
+      expect(play.getAttribute("aria-label")).toBe("Vorschau pausieren");
+      play.click();
+      expect(play.getAttribute("aria-label")).toBe("Vorschau abspielen");
+    } finally {
+      finishPreload?.();
+      preload.mockRestore();
+      vi.unstubAllGlobals();
+    }
   });
 });

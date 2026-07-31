@@ -141,24 +141,24 @@ describe("media dimensions", () => {
     expect(canvasScale(1920, 1080)).toBe(1);
   });
 
-  it("uses the complete width for a portrait chat and scales all chrome consistently", () => {
+  it("uses the complete width for a portrait chat without reserving composer space", () => {
     const metrics = computeRenderMetrics(720, 1280);
     expect(metrics.scale).toBe(1);
     expect(metrics.contentX).toBe(0);
     expect(metrics.contentWidth).toBe(720);
     expect(metrics.headerHeight).toBe(114);
-    expect(metrics.composerHeight).toBe(106);
+    expect(metrics).not.toHaveProperty("composerHeight");
     expect(metrics.bubbleMaxWidth).toBeCloseTo(547.2, 8);
     expect(metrics.sidePadding).toBe(28);
   });
 
-  it("centers a WhatsApp-sized chat column in a wide landscape export", () => {
+  it("centers a WhatsApp-sized chat column in a wide landscape export without a composer", () => {
     const metrics = computeRenderMetrics(1920, 1080);
     expect(metrics.scale).toBe(1);
     expect(metrics.contentWidth).toBeCloseTo(1144.8, 8);
     expect(metrics.contentX).toBeCloseTo(387.6, 8);
     expect(metrics.headerHeight).toBeCloseTo(88.92, 8);
-    expect(metrics.composerHeight).toBeCloseTo(82.68, 8);
+    expect(metrics).not.toHaveProperty("composerHeight");
     expect(metrics.bubbleMaxWidth).toBe(760);
     expect(metrics.sidePadding).toBe(28);
   });

@@ -170,9 +170,15 @@ function setExportBusy(busy: boolean): void {
   for (const control of controls) control.disabled = busy;
   if (!busy) {
     const identityReady = Boolean(selfSelect.value);
-    playButton.disabled = !project || !mediaReady || !identityReady;
+    // Previewing is useful immediately after the chat has been parsed. Media
+    // metadata can take a while to inspect in a large ZIP, and message
+    // direction can be chosen later without changing the timeline itself.
+    playButton.disabled = !project || !timeline.events.length;
     scrubber.disabled = !project;
-    exportButton.disabled = !project || !mediaReady || !identityReady;
+    // Export performs its own selected-media preflight in startExport(). The
+    // sender identity is still required so incoming/outgoing bubbles are
+    // deterministic in the resulting video.
+    exportButton.disabled = !project || !timeline.events.length || !identityReady;
   }
   dropZone.classList.toggle("is-disabled", busy);
   dropZone.setAttribute("aria-disabled", String(busy));
@@ -341,9 +347,17 @@ function updateSelfHint(): void {
 }
 
 function setProjectReadyStatus(): void {
-  if (!project || !mediaReady || !mediaStore) return;
-  const mediaIssueCount = mediaStore.getMediaIssues(project.chat.messages).length;
+  if (!project || !mediaStore) return;
   const count = logicalMessageCount(project.chat.messages).toLocaleString("de-DE");
+  if (!mediaReady) {
+    if (!selfSelect.value) {
+      setStatus(`${count} Nachrichten sind bereit. Die Vorschau kann sofort starten; für den Export bitte „Ich bin“ wählen. Medienlängen werden im Hintergrund gelesen.`, "info");
+    } else {
+      setStatus(`${count} Nachrichten sind bereit. Medienlängen werden im Hintergrund gelesen.`, "info");
+    }
+    return;
+  }
+  const mediaIssueCount = mediaStore.getMediaIssues(project.chat.messages).length;
   if (!selfSelect.value) {
     setStatus(`${count} Nachrichten sind bereit. Bitte wähle unter „Ich bin“ deinen Absender aus.`, "info");
   } else if (mediaIssueCount) {
@@ -354,7 +368,7 @@ function setProjectReadyStatus(): void {
 }
 
 function togglePlayback(): void {
-  if (!timeline.events.length || !selfSelect.value) return;
+  if (!timeline.events.length) return;
   if (playing) {
     stopPlayback();
     return;
@@ -390,12 +404,18 @@ async function prepareMediaForPreview(): Promise<void> {
   const activeProject = project;
   if (!activeStore || !activeProject || !timeline.events.length) return;
   const generation = ++mediaPreparationGeneration;
-  await activeStore.preloadForMessages(activeProject.chat.messages);
+  let preparationWarning = "";
+  try {
+    await activeStore.preloadForMessages(activeProject.chat.messages);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "Unbekannter Fehler";
+    preparationWarning = `Die Medienprüfung wurde vorzeitig beendet: ${detail}`;
+  }
   if (generation !== mediaPreparationGeneration || mediaStore !== activeStore || project !== activeProject) return;
   updateTimeline(false, true);
   const mediaIssues = activeStore.getMediaIssues(activeProject.chat.messages);
   const diagnostic = element<HTMLDivElement>("diagnostic");
-  diagnostic.textContent = [baseDiagnostics, ...mediaIssues].filter(Boolean).join(" ");
+  diagnostic.textContent = [baseDiagnostics, preparationWarning, ...mediaIssues].filter(Boolean).join(" ");
   diagnostic.hidden = !diagnostic.textContent;
   mediaReady = true;
   setExportBusy(false);
@@ -413,7 +433,6 @@ function populateProject(nextProject: ImportedProject, options: {
   mediaPreparationGeneration += 1;
   mediaReady = false;
   project = nextProject;
-  setExportBusy(false);
   mediaStore?.dispose();
   mediaStore = new AssetMediaStore(project);
   renderer = new ChatCanvasRenderer(previewCanvas, mediaStore);
@@ -472,7 +491,8 @@ function populateProject(nextProject: ImportedProject, options: {
   dateOrderSelect.value = project.chat.diagnostics.dateOrderAmbiguous ? "auto" : project.chat.diagnostics.dateOrder;
   applyCanvasPreset();
   updateTimeline(true);
-  setStatus(`${logicalMessageCount(project.chat.messages).toLocaleString("de-DE")} Nachrichten importiert; Medienlängen werden gelesen …`);
+  setExportBusy(false);
+  setProjectReadyStatus();
   void prepareMediaForPreview();
 }
 
