@@ -7,6 +7,7 @@ import {
   canvasScale,
   cleanMediaCaption,
   combinedPlaybackDuration,
+  computeRenderMetrics,
   fitMediaBox,
   forwardedPresentationLabel,
   isFirstAttachmentGroupItem,
@@ -17,7 +18,9 @@ import {
   MAX_ANIMATED_IMAGE_FRAMES,
   messageGapAfter,
   messageCardPresentation,
+  messageSequencePosition,
   messagesShareAttachmentGroup,
+  messagesShareSequence,
   oversizedBubbleScrollOffset,
   shouldShowMessageTimestamp,
   shouldRenderCircularVideoNote,
@@ -136,6 +139,28 @@ describe("media dimensions", () => {
     expect(canvasScale(720, 1280)).toBeCloseTo(2 / 3, 8);
     expect(canvasScale(1080, 1080)).toBe(1);
     expect(canvasScale(1920, 1080)).toBe(1);
+  });
+
+  it("uses the complete width for a portrait chat and scales all chrome consistently", () => {
+    const metrics = computeRenderMetrics(720, 1280);
+    expect(metrics.scale).toBe(1);
+    expect(metrics.contentX).toBe(0);
+    expect(metrics.contentWidth).toBe(720);
+    expect(metrics.headerHeight).toBe(114);
+    expect(metrics.composerHeight).toBe(106);
+    expect(metrics.bubbleMaxWidth).toBeCloseTo(547.2, 8);
+    expect(metrics.sidePadding).toBe(28);
+  });
+
+  it("centers a WhatsApp-sized chat column in a wide landscape export", () => {
+    const metrics = computeRenderMetrics(1920, 1080);
+    expect(metrics.scale).toBe(1);
+    expect(metrics.contentWidth).toBeCloseTo(1144.8, 8);
+    expect(metrics.contentX).toBeCloseTo(387.6, 8);
+    expect(metrics.headerHeight).toBeCloseTo(88.92, 8);
+    expect(metrics.composerHeight).toBeCloseTo(82.68, 8);
+    expect(metrics.bubbleMaxWidth).toBe(760);
+    expect(metrics.sidePadding).toBe(28);
   });
 
   it("rounds only genuinely square video notes", () => {
@@ -262,8 +287,8 @@ describe("explicit attachment groups", () => {
     expect(attachmentGroupIndexLabel(last)).toBe("3/3");
     expect(messagesShareAttachmentGroup(first, middle)).toBe(true);
     expect(messagesShareAttachmentGroup(first, last)).toBe(false);
-    expect(messageGapAfter(first, middle, 2)).toBe(10);
-    expect(messageGapAfter(middle, message(), 2)).toBe(30);
+    expect(messageGapAfter(first, middle, 2)).toBe(8);
+    expect(messageGapAfter(middle, message({ sender: "Mia" }), 2)).toBe(28);
   });
 
   it("keeps ordinary messages self-contained", () => {
@@ -275,9 +300,53 @@ describe("explicit attachment groups", () => {
   });
 
   it("labels frequently forwarded messages once at the start of a group", () => {
-    expect(forwardedPresentationLabel(message({ forwarded: true }))).toBe("↪  WEITERGELEITET");
-    expect(forwardedPresentationLabel(message({ forwarded: true, frequentlyForwarded: true }))).toBe("↪  HÄUFIG WEITERGELEITET");
+    expect(forwardedPresentationLabel(message({ forwarded: true }))).toBe("Weitergeleitet");
+    expect(forwardedPresentationLabel(message({ forwarded: true, frequentlyForwarded: true }))).toBe("Häufig weitergeleitet");
     expect(forwardedPresentationLabel({ ...groupItem(1), forwarded: true, frequentlyForwarded: true })).toBeUndefined();
+  });
+});
+
+describe("message sequences", () => {
+  const at = (minutes: number, overrides: Partial<ChatMessage> = {}): ChatMessage => message({
+    id: `message-${minutes}`,
+    sourceOrder: minutes,
+    timestamp: new Date(2026, 6, 20, 10, minutes),
+    ...overrides,
+  });
+
+  it("joins consecutive messages from the same participant for up to five minutes", () => {
+    expect(messagesShareSequence(at(0), at(5))).toBe(true);
+    expect(messagesShareSequence(at(0), at(6))).toBe(false);
+    expect(messagesShareSequence(at(5), at(4))).toBe(false);
+    expect(messagesShareSequence(at(0), at(1, { sender: "Mia" }))).toBe(false);
+  });
+
+  it("does not join messages across a calendar-day boundary or system events", () => {
+    const beforeMidnight = message({ timestamp: new Date(2026, 6, 20, 23, 59) });
+    const afterMidnight = message({ timestamp: new Date(2026, 6, 21, 0, 1) });
+    expect(messagesShareSequence(beforeMidnight, afterMidnight)).toBe(false);
+    expect(messagesShareSequence(at(0), at(1, { sender: undefined }))).toBe(false);
+  });
+
+  it("marks the first, middle and last bubble of a participant sequence", () => {
+    const first = at(0);
+    const middle = at(1);
+    const last = at(2);
+    expect(messageSequencePosition(undefined, first, middle)).toBe("first");
+    expect(messageSequencePosition(first, middle, last)).toBe("middle");
+    expect(messageSequencePosition(middle, last, undefined)).toBe("last");
+  });
+
+  it("keeps isolated messages and system events as single bubbles", () => {
+    const isolated = at(0);
+    const system = at(1, { sender: undefined, kind: "system" });
+    expect(messageSequencePosition(undefined, isolated, undefined)).toBe("single");
+    expect(messageSequencePosition(isolated, system, at(2))).toBe("single");
+  });
+
+  it("uses compact spacing inside a sequence and the normal gap between participants", () => {
+    expect(messageGapAfter(at(0), at(1), 1.5)).toBe(6);
+    expect(messageGapAfter(at(0), at(1, { sender: "Mia" }), 1.5)).toBe(21);
   });
 });
 

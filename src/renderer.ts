@@ -1,5 +1,5 @@
 import { ALL_FORMATS, AudioBufferSink, BlobSource, Input, VideoSample, VideoSampleSink } from "mediabunny";
-import { messageDirection } from "./identity";
+import { hasExplicitGroupEvidence, messageDirection, sameParticipant } from "./identity";
 import { visibleEventCount } from "./timeline";
 import { parseVCard, type ContactCardInfo } from "./vcard";
 import type {
@@ -75,7 +75,24 @@ interface BubbleLayout {
   cardWidth: number;
   cardHeight: number;
   dateLabel?: string;
+  sequence: MessageSequencePosition;
+  timestampInline: boolean;
+  timestampOverlay: boolean;
+  topPadding: number;
+  bottomPadding: number;
 }
+
+export interface RenderMetrics {
+  scale: number;
+  contentX: number;
+  contentWidth: number;
+  headerHeight: number;
+  composerHeight: number;
+  bubbleMaxWidth: number;
+  sidePadding: number;
+}
+
+export type MessageSequencePosition = "single" | "first" | "middle" | "last";
 
 export function fitMediaBox(
   sourceWidth: number,
@@ -99,6 +116,25 @@ export function shouldRenderCircularVideoNote(
 
 export function canvasScale(width: number, height: number): number {
   return Math.max(0.1, Math.min(width / 1080, height / 1080));
+}
+
+export function computeRenderMetrics(width: number, height: number): RenderMetrics {
+  const landscape = width / Math.max(1, height) >= 1.25;
+  const square = width / Math.max(1, height) >= 0.85;
+  const contentWidth = landscape ? Math.min(width, height * 1.06) : width;
+  const scale = Math.max(0.1, landscape || square
+    ? Math.min(contentWidth / 1080, height / 1080)
+    : Math.min(contentWidth / 720, height / 1280));
+  const chromeFactor = landscape ? 0.78 : 1;
+  return {
+    scale,
+    contentX: (width - contentWidth) / 2,
+    contentWidth,
+    headerHeight: 114 * scale * chromeFactor,
+    composerHeight: 106 * scale * chromeFactor,
+    bubbleMaxWidth: Math.min(760 * scale, contentWidth * 0.76),
+    sidePadding: 28 * scale,
+  };
 }
 
 export function animatedFrameIndex(frameDurations: number[], time: number, totalDuration: number): number {
@@ -166,7 +202,29 @@ export function messagesShareAttachmentGroup(current: ChatMessage, next: ChatMes
 }
 
 export function messageGapAfter(current: ChatMessage, next: ChatMessage | undefined, scale = 1): number {
-  return (messagesShareAttachmentGroup(current, next) ? 5 : 15) * scale;
+  if (messagesShareAttachmentGroup(current, next)) return 4 * scale;
+  return (messagesShareSequence(current, next) ? 4 : 14) * scale;
+}
+
+export function messagesShareSequence(current: ChatMessage | undefined, next: ChatMessage | undefined): boolean {
+  if (!current?.sender || !next?.sender || !sameParticipant(current.sender, next.sender)) return false;
+  if (dayKey(current.timestamp) !== dayKey(next.timestamp)) return false;
+  const elapsed = next.timestamp.getTime() - current.timestamp.getTime();
+  return elapsed >= 0 && elapsed <= 5 * 60 * 1000;
+}
+
+export function messageSequencePosition(
+  previous: ChatMessage | undefined,
+  current: ChatMessage,
+  next: ChatMessage | undefined,
+): MessageSequencePosition {
+  if (!current.sender) return "single";
+  const joinsPrevious = messagesShareSequence(previous, current);
+  const joinsNext = messagesShareSequence(current, next);
+  if (joinsPrevious && joinsNext) return "middle";
+  if (joinsPrevious) return "last";
+  if (joinsNext) return "first";
+  return "single";
 }
 
 export function shouldShowMessageTimestamp(message: ChatMessage): boolean {
@@ -175,8 +233,8 @@ export function shouldShowMessageTimestamp(message: ChatMessage): boolean {
 
 export function forwardedPresentationLabel(message: ChatMessage): string | undefined {
   if (!isFirstAttachmentGroupItem(message)) return undefined;
-  if (message.frequentlyForwarded) return "↪  HÄUFIG WEITERGELEITET";
-  return message.forwarded ? "↪  WEITERGELEITET" : undefined;
+  if (message.frequentlyForwarded) return "Häufig weitergeleitet";
+  return message.forwarded ? "Weitergeleitet" : undefined;
 }
 
 export function combinedPlaybackDuration(
@@ -359,48 +417,57 @@ interface Palette {
   background: string;
   pattern: string;
   header: string;
+  headerDivider: string;
   headerText: string;
   headerMuted: string;
   incoming: string;
   outgoing: string;
   text: string;
   mutedText: string;
+  outgoingMuted: string;
   system: string;
   input: string;
   accent: string;
   media: string;
+  senderColors: string[];
 }
 
 const LIGHT: Palette = {
   background: "#efeae2",
-  pattern: "rgba(92, 88, 81, .08)",
+  pattern: "rgba(92, 88, 81, .095)",
   header: "#f0f2f5",
+  headerDivider: "rgba(17, 27, 33, .08)",
   headerText: "#111b21",
   headerMuted: "#667781",
   incoming: "#ffffff",
   outgoing: "#d9fdd3",
   text: "#111b21",
   mutedText: "#667781",
+  outgoingMuted: "#5f7669",
   system: "#ffffffd9",
   input: "#ffffff",
   accent: "#00a884",
   media: "#d9e1e5",
+  senderColors: ["#007bfc", "#d6409f", "#00a884", "#d97706", "#7c5ac7", "#c94b45"],
 };
 
 const DARK: Palette = {
   background: "#0b141a",
-  pattern: "rgba(177, 185, 189, .055)",
+  pattern: "rgba(177, 185, 189, .07)",
   header: "#202c33",
+  headerDivider: "rgba(255, 255, 255, .05)",
   headerText: "#e9edef",
   headerMuted: "#8696a0",
   incoming: "#202c33",
   outgoing: "#005c4b",
   text: "#e9edef",
   mutedText: "#8696a0",
+  outgoingMuted: "#8fbab1",
   system: "#182229e8",
   input: "#202c33",
   accent: "#00a884",
   media: "#26363e",
+  senderColors: ["#53bdeb", "#ff8bd4", "#06cf9c", "#ffb55f", "#c7a8ff", "#ff8a80"],
 };
 
 function clamp(value: number, min: number, max: number): number {
@@ -432,6 +499,46 @@ function roundedRect(ctx: CanvasRenderingContext2D, x: number, y: number, width:
   ctx.closePath();
 }
 
+function roundedRectCorners(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  topLeft: number,
+  topRight: number,
+  bottomRight: number,
+  bottomLeft: number,
+): void {
+  const limit = Math.min(width / 2, height / 2);
+  const tl = Math.min(limit, topLeft);
+  const tr = Math.min(limit, topRight);
+  const br = Math.min(limit, bottomRight);
+  const bl = Math.min(limit, bottomLeft);
+  ctx.beginPath();
+  ctx.moveTo(x + tl, y);
+  ctx.lineTo(x + width - tr, y);
+  ctx.arcTo(x + width, y, x + width, y + tr, tr);
+  ctx.lineTo(x + width, y + height - br);
+  ctx.arcTo(x + width, y + height, x + width - br, y + height, br);
+  ctx.lineTo(x + bl, y + height);
+  ctx.arcTo(x, y + height, x, y + height - bl, bl);
+  ctx.lineTo(x, y + tl);
+  ctx.arcTo(x, y, x + tl, y, tl);
+  ctx.closePath();
+}
+
+function ellipsizeText(ctx: CanvasRenderingContext2D, value: string, maxWidth: number): string {
+  if (ctx.measureText(value).width <= maxWidth) return value;
+  const suffix = "…";
+  let output = "";
+  for (const character of graphemes(value)) {
+    if (ctx.measureText(output + character + suffix).width > maxWidth) break;
+    output += character;
+  }
+  return output ? output + suffix : suffix;
+}
+
 function initials(value: string): string {
   const parts = value.trim().split(/\s+/u).filter(Boolean);
   return (parts.slice(0, 2).map((part) => part[0]?.toLocaleUpperCase() ?? "").join("") || "WA").slice(0, 2);
@@ -442,9 +549,7 @@ function dayKey(date: Date): string {
 }
 
 function formatDay(date: Date): string {
-  const today = new Date();
-  if (dayKey(date) === dayKey(today)) return "HEUTE";
-  return new Intl.DateTimeFormat("de-DE", { weekday: "short", day: "2-digit", month: "short", year: "numeric" }).format(date).toLocaleUpperCase();
+  return new Intl.DateTimeFormat("de-DE", { day: "2-digit", month: "2-digit", year: "numeric" }).format(date);
 }
 
 function formatTime(date: Date): string {
@@ -473,10 +578,21 @@ function pseudonym(name: string, participants: string[]): string {
   return `Person ${String.fromCharCode(65 + (index % 26))}`;
 }
 
-function senderLabel(message: ChatMessage, theme: RenderTheme, participants: string[]): string {
-  if (!isFirstAttachmentGroupItem(message)) return "";
+function senderLabel(
+  message: ChatMessage,
+  theme: RenderTheme,
+  participants: string[],
+  groupChat: boolean,
+  sequence: MessageSequencePosition,
+): string {
+  if (!groupChat || !isFirstAttachmentGroupItem(message) || !["single", "first"].includes(sequence)) return "";
   if (!message.sender || messageDirection(message, theme.selfName) === "outgoing") return "";
   return theme.anonymize ? pseudonym(message.sender, participants) : message.sender;
+}
+
+function senderColor(sender: string, participants: string[], palette: Palette): string {
+  const index = Math.max(0, participants.findIndex((participant) => sameParticipant(participant, sender)));
+  return palette.senderColors[index % palette.senderColors.length] ?? palette.accent;
 }
 
 export class AssetMediaStore {
@@ -1204,6 +1320,7 @@ export class ChatCanvasRenderer {
   private currentTime = 0;
   private eventTimes = new Map<string, number>();
   private eventDurations = new Map<string, number>();
+  private groupChat = false;
 
   constructor(private readonly canvas: HTMLCanvasElement, private readonly media: AssetMediaStore) {
     const context = canvas.getContext("2d", { alpha: false });
@@ -1223,27 +1340,27 @@ export class ChatCanvasRenderer {
         .filter((event) => Boolean(event.mediaDuration))
         .map((event) => [event.message.id, event.mediaDuration ?? 0]));
     }
+    this.groupChat = this.participants.length > 2
+      || hasExplicitGroupEvidence(timeline.events.map((event) => event.message));
     this.currentTime = time;
     const ctx = this.ctx;
     const { width: w, height: h } = this.canvas;
-    const scale = canvasScale(w, h);
+    const metrics = computeRenderMetrics(w, h);
     const palette = theme.mode === "dark" ? DARK : LIGHT;
     ctx.save();
     ctx.globalAlpha = 1;
     ctx.fillStyle = palette.background;
     ctx.fillRect(0, 0, w, h);
-    this.drawPattern(palette, scale);
+    this.drawPattern(palette, metrics.scale);
 
-    const headerH = 132 * scale;
-    const inputH = 118 * scale;
-    this.drawHeader(theme, palette, headerH, scale, timeline, time);
-    this.drawInputBar(palette, h - inputH, inputH, scale);
+    this.drawHeader(theme, palette, metrics);
+    this.drawInputBar(palette, h - metrics.composerHeight, metrics);
 
     ctx.save();
     ctx.beginPath();
-    ctx.rect(0, headerH, w, h - headerH - inputH);
+    ctx.rect(0, metrics.headerHeight, w, h - metrics.headerHeight - metrics.composerHeight);
     ctx.clip();
-    this.drawMessages(timeline, time, theme, palette, h - inputH, scale);
+    this.drawMessages(timeline, time, theme, palette, h - metrics.composerHeight, metrics);
     ctx.restore();
     ctx.restore();
   }
@@ -1279,83 +1396,265 @@ export class ChatCanvasRenderer {
   private drawPattern(palette: Palette, scale: number): void {
     const ctx = this.ctx;
     const { width: w, height: h } = this.canvas;
-    const step = 150 * scale;
+    const step = 180 * scale;
     ctx.strokeStyle = palette.pattern;
-    ctx.lineWidth = 3 * scale;
-    for (let y = 0; y < h; y += step) {
-      for (let x = (Math.floor(y / step) % 2) * step * 0.45; x < w; x += step) {
-        ctx.beginPath();
-        ctx.arc(x, y, 18 * scale, 0.2, 2.1);
-        ctx.stroke();
-        ctx.beginPath();
-        ctx.moveTo(x + 34 * scale, y + 18 * scale);
-        ctx.lineTo(x + 56 * scale, y + 30 * scale);
-        ctx.lineTo(x + 44 * scale, y + 48 * scale);
-        ctx.stroke();
+    ctx.lineWidth = 1.65 * scale;
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    for (let row = 0, y = 34 * scale; y < h; row += 1, y += step) {
+      for (let column = 0, x = 28 * scale + (row % 2) * step * 0.47; x < w; column += 1, x += step) {
+        const variant = (row * 3 + column * 5) % 6;
+        if (variant === 0) {
+          roundedRect(ctx, x, y, 46 * scale, 32 * scale, 8 * scale);
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.moveTo(x + 9 * scale, y + 31 * scale);
+          ctx.lineTo(x + 4 * scale, y + 40 * scale);
+          ctx.lineTo(x + 18 * scale, y + 33 * scale);
+          ctx.stroke();
+        } else if (variant === 1) {
+          roundedRect(ctx, x, y + 4 * scale, 45 * scale, 32 * scale, 7 * scale);
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.arc(x + 22 * scale, y + 20 * scale, 8 * scale, 0, Math.PI * 2);
+          ctx.stroke();
+        } else if (variant === 2) {
+          ctx.beginPath();
+          ctx.arc(x + 20 * scale, y + 20 * scale, 18 * scale, 0, Math.PI * 2);
+          ctx.moveTo(x + 13 * scale, y + 15 * scale);
+          ctx.arc(x + 13 * scale, y + 15 * scale, 1.3 * scale, 0, Math.PI * 2);
+          ctx.moveTo(x + 27 * scale, y + 15 * scale);
+          ctx.arc(x + 27 * scale, y + 15 * scale, 1.3 * scale, 0, Math.PI * 2);
+          ctx.moveTo(x + 10 * scale, y + 22 * scale);
+          ctx.arc(x + 20 * scale, y + 21 * scale, 10 * scale, 0.15, Math.PI - 0.15);
+          ctx.stroke();
+        } else if (variant === 3) {
+          ctx.beginPath();
+          for (let point = 0; point < 10; point += 1) {
+            const angle = -Math.PI / 2 + point * Math.PI / 5;
+            const radius = (point % 2 === 0 ? 19 : 8) * scale;
+            const px = x + 20 * scale + Math.cos(angle) * radius;
+            const py = y + 20 * scale + Math.sin(angle) * radius;
+            if (point === 0) ctx.moveTo(px, py);
+            else ctx.lineTo(px, py);
+          }
+          ctx.closePath();
+          ctx.stroke();
+        } else if (variant === 4) {
+          ctx.beginPath();
+          ctx.moveTo(x, y + 9 * scale);
+          ctx.lineTo(x + 43 * scale, y + 20 * scale);
+          ctx.lineTo(x + 4 * scale, y + 36 * scale);
+          ctx.lineTo(x + 13 * scale, y + 22 * scale);
+          ctx.closePath();
+          ctx.stroke();
+        } else {
+          ctx.beginPath();
+          ctx.arc(x + 14 * scale, y + 15 * scale, 10 * scale, Math.PI, 0);
+          ctx.arc(x + 30 * scale, y + 15 * scale, 10 * scale, Math.PI, 0);
+          ctx.lineTo(x + 22 * scale, y + 38 * scale);
+          ctx.lineTo(x + 5 * scale, y + 16 * scale);
+          ctx.stroke();
+        }
       }
     }
   }
 
-  private drawHeader(theme: RenderTheme, palette: Palette, height: number, scale: number, timeline: CompiledTimeline, time: number): void {
+  private drawHeader(theme: RenderTheme, palette: Palette, metrics: RenderMetrics): void {
     const ctx = this.ctx;
     const w = this.canvas.width;
+    const { contentX, contentWidth, headerHeight: height, scale } = metrics;
+    const right = contentX + contentWidth;
     ctx.fillStyle = palette.header;
     ctx.fillRect(0, 0, w, height);
-    const avatarX = 76 * scale;
+    ctx.fillStyle = palette.headerDivider;
+    ctx.fillRect(0, height - Math.max(1, scale), w, Math.max(1, scale));
+
+    const avatarX = contentX + 79 * scale;
     const avatarY = height / 2;
+    this.drawBackIcon(contentX + 28 * scale, avatarY, palette.headerMuted, scale);
     ctx.fillStyle = palette.accent;
     ctx.beginPath();
-    ctx.arc(avatarX, avatarY, 42 * scale, 0, Math.PI * 2);
+    ctx.arc(avatarX, avatarY, 35 * scale, 0, Math.PI * 2);
     ctx.fill();
     ctx.fillStyle = "#ffffff";
-    ctx.font = `500 ${30 * scale}px system-ui, -apple-system, sans-serif`;
+    ctx.font = `600 ${23 * scale}px system-ui, -apple-system, sans-serif`;
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     ctx.fillText(initials(theme.title), avatarX, avatarY + 1 * scale);
+
+    const videoX = right - 136 * scale;
+    const phoneX = right - 86 * scale;
+    const menuX = right - 35 * scale;
+    const titleX = contentX + 128 * scale;
+    const titleMaxWidth = Math.max(80 * scale, videoX - titleX - 24 * scale);
+    const subtitle = this.groupChat
+      ? this.participants
+        .filter((participant) => theme.selfName !== participant)
+        .slice(0, 4)
+        .map((participant) => theme.anonymize ? pseudonym(participant, this.participants) : participant)
+        .join(", ")
+      : "";
     ctx.textAlign = "left";
     ctx.fillStyle = palette.headerText;
-    ctx.font = `500 ${34 * scale}px system-ui, -apple-system, sans-serif`;
-    ctx.fillText(theme.title || "WhatsApp Replay", 138 * scale, 52 * scale);
-    const count = visibleEventCount(timeline, time);
-    const current = timeline.events[Math.max(0, count - 1)]?.message;
-    ctx.fillStyle = palette.headerMuted;
-    ctx.font = `400 ${24 * scale}px system-ui, -apple-system, sans-serif`;
-    ctx.fillText(current ? `${formatDay(current.timestamp)} · ${formatTime(current.timestamp)}` : "Chat-Replay", 138 * scale, 91 * scale);
-
-    ctx.strokeStyle = palette.headerMuted;
-    ctx.lineWidth = 4 * scale;
-    for (let i = 0; i < 3; i += 1) {
-      ctx.beginPath();
-      ctx.arc(w - 62 * scale, (49 + i * 17) * scale, 2.5 * scale, 0, Math.PI * 2);
-      ctx.stroke();
+    ctx.font = `600 ${30 * scale}px system-ui, -apple-system, sans-serif`;
+    ctx.textBaseline = "middle";
+    ctx.fillText(ellipsizeText(ctx, theme.title || "WhatsApp Replay", titleMaxWidth), titleX, subtitle ? height * 0.39 : height * 0.52);
+    if (subtitle) {
+      ctx.fillStyle = palette.headerMuted;
+      ctx.font = `400 ${18 * scale}px system-ui, -apple-system, sans-serif`;
+      ctx.fillText(ellipsizeText(ctx, subtitle, titleMaxWidth), titleX, height * 0.7);
     }
+    this.drawVideoCallIcon(videoX, avatarY, palette.headerMuted, scale);
+    this.drawPhoneIcon(phoneX, avatarY, palette.headerMuted, scale);
+    this.drawMenuIcon(menuX, avatarY, palette.headerMuted, scale);
   }
 
-  private drawInputBar(palette: Palette, y: number, height: number, scale: number): void {
+  private drawInputBar(palette: Palette, y: number, metrics: RenderMetrics): void {
     const ctx = this.ctx;
     const w = this.canvas.width;
+    const { contentX, contentWidth, composerHeight: height, scale } = metrics;
+    const right = contentX + contentWidth;
+    const centerY = y + height / 2;
     ctx.fillStyle = palette.header;
     ctx.fillRect(0, y, w, height);
-    roundedRect(ctx, 30 * scale, y + 23 * scale, w - 125 * scale, 70 * scale, 35 * scale);
+    const plusX = contentX + 31 * scale;
+    const micX = right - 32 * scale;
+    const inputX = contentX + 62 * scale;
+    const inputRight = micX - 47 * scale;
+    roundedRect(ctx, inputX, centerY - 33 * scale, inputRight - inputX, 66 * scale, 33 * scale);
     ctx.fillStyle = palette.input;
     ctx.fill();
     ctx.fillStyle = palette.headerMuted;
-    ctx.font = `400 ${27 * scale}px system-ui, -apple-system, sans-serif`;
+    ctx.font = `400 ${24 * scale}px system-ui, -apple-system, sans-serif`;
     ctx.textAlign = "left";
     ctx.textBaseline = "middle";
-    ctx.fillText("Nachricht", 82 * scale, y + 59 * scale);
+    ctx.fillText("Nachricht", inputX + 55 * scale, centerY + 1 * scale);
+    this.drawPlusIcon(plusX, centerY, palette.headerMuted, scale);
+    this.drawSmileIcon(inputX + 27 * scale, centerY, palette.headerMuted, scale);
+    this.drawAttachmentIcon(inputRight - 65 * scale, centerY, palette.headerMuted, scale);
+    this.drawCameraIcon(inputRight - 27 * scale, centerY, palette.headerMuted, scale);
     ctx.fillStyle = palette.accent;
     ctx.beginPath();
-    ctx.arc(w - 52 * scale, y + 58 * scale, 35 * scale, 0, Math.PI * 2);
+    ctx.arc(micX, centerY, 31 * scale, 0, Math.PI * 2);
     ctx.fill();
-    ctx.strokeStyle = "#ffffff";
-    ctx.lineWidth = 4 * scale;
+    this.drawMicrophoneIcon(micX, centerY, "#ffffff", scale);
+  }
+
+  private prepareIcon(color: string, scale: number): void {
+    this.ctx.strokeStyle = color;
+    this.ctx.fillStyle = color;
+    this.ctx.lineWidth = Math.max(1.5, 2.8 * scale);
+    this.ctx.lineCap = "round";
+    this.ctx.lineJoin = "round";
+  }
+
+  private drawBackIcon(x: number, y: number, color: string, scale: number): void {
+    const ctx = this.ctx;
+    this.prepareIcon(color, scale);
     ctx.beginPath();
-    ctx.moveTo(w - 52 * scale, y + 45 * scale);
-    ctx.lineTo(w - 52 * scale, y + 66 * scale);
+    ctx.moveTo(x + 8 * scale, y - 15 * scale);
+    ctx.lineTo(x - 7 * scale, y);
+    ctx.lineTo(x + 8 * scale, y + 15 * scale);
+    ctx.moveTo(x - 6 * scale, y);
+    ctx.lineTo(x + 18 * scale, y);
+    ctx.stroke();
+  }
+
+  private drawVideoCallIcon(x: number, y: number, color: string, scale: number): void {
+    const ctx = this.ctx;
+    this.prepareIcon(color, scale);
+    roundedRect(ctx, x - 16 * scale, y - 11 * scale, 24 * scale, 22 * scale, 4 * scale);
     ctx.stroke();
     ctx.beginPath();
-    ctx.arc(w - 52 * scale, y + 58 * scale, 12 * scale, 0, Math.PI);
+    ctx.moveTo(x + 8 * scale, y - 6 * scale);
+    ctx.lineTo(x + 19 * scale, y - 12 * scale);
+    ctx.lineTo(x + 19 * scale, y + 12 * scale);
+    ctx.lineTo(x + 8 * scale, y + 6 * scale);
+    ctx.closePath();
+    ctx.stroke();
+  }
+
+  private drawPhoneIcon(x: number, y: number, color: string, scale: number): void {
+    const ctx = this.ctx;
+    this.prepareIcon(color, scale);
+    ctx.beginPath();
+    ctx.arc(x, y, 17 * scale, 0.45, 2.68);
+    ctx.moveTo(x + 15 * scale, y + 7 * scale);
+    ctx.lineTo(x + 20 * scale, y + 15 * scale);
+    ctx.lineTo(x + 12 * scale, y + 19 * scale);
+    ctx.moveTo(x - 15 * scale, y - 7 * scale);
+    ctx.lineTo(x - 20 * scale, y - 15 * scale);
+    ctx.lineTo(x - 12 * scale, y - 19 * scale);
+    ctx.stroke();
+  }
+
+  private drawMenuIcon(x: number, y: number, color: string, scale: number): void {
+    const ctx = this.ctx;
+    this.prepareIcon(color, scale);
+    for (const offset of [-10, 0, 10]) {
+      ctx.beginPath();
+      ctx.arc(x, y + offset * scale, 2.1 * scale, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  private drawPlusIcon(x: number, y: number, color: string, scale: number): void {
+    const ctx = this.ctx;
+    this.prepareIcon(color, scale);
+    ctx.beginPath();
+    ctx.arc(x, y, 19 * scale, 0, Math.PI * 2);
+    ctx.moveTo(x - 8 * scale, y);
+    ctx.lineTo(x + 8 * scale, y);
+    ctx.moveTo(x, y - 8 * scale);
+    ctx.lineTo(x, y + 8 * scale);
+    ctx.stroke();
+  }
+
+  private drawSmileIcon(x: number, y: number, color: string, scale: number): void {
+    const ctx = this.ctx;
+    this.prepareIcon(color, scale);
+    ctx.beginPath();
+    ctx.arc(x, y, 15 * scale, 0, Math.PI * 2);
+    ctx.moveTo(x - 6 * scale, y - 4 * scale);
+    ctx.arc(x - 6 * scale, y - 4 * scale, 1.2 * scale, 0, Math.PI * 2);
+    ctx.moveTo(x + 6 * scale, y - 4 * scale);
+    ctx.arc(x + 6 * scale, y - 4 * scale, 1.2 * scale, 0, Math.PI * 2);
+    ctx.moveTo(x - 7 * scale, y + 3 * scale);
+    ctx.arc(x, y + 2 * scale, 8 * scale, 0.18, Math.PI - 0.18);
+    ctx.stroke();
+  }
+
+  private drawAttachmentIcon(x: number, y: number, color: string, scale: number): void {
+    const ctx = this.ctx;
+    this.prepareIcon(color, scale);
+    ctx.beginPath();
+    ctx.arc(x, y, 13 * scale, 0.7, 5.3);
+    ctx.arc(x, y, 8 * scale, 5.3, 0.7, true);
+    ctx.stroke();
+  }
+
+  private drawCameraIcon(x: number, y: number, color: string, scale: number): void {
+    const ctx = this.ctx;
+    this.prepareIcon(color, scale);
+    roundedRect(ctx, x - 15 * scale, y - 11 * scale, 30 * scale, 22 * scale, 5 * scale);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(x, y, 6 * scale, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  private drawMicrophoneIcon(x: number, y: number, color: string, scale: number): void {
+    const ctx = this.ctx;
+    this.prepareIcon(color, scale);
+    roundedRect(ctx, x - 6 * scale, y - 14 * scale, 12 * scale, 22 * scale, 6 * scale);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(x, y, 5 * scale, 0, Math.PI);
+    ctx.moveTo(x, y + 10 * scale);
+    ctx.lineTo(x, y + 17 * scale);
+    ctx.moveTo(x - 7 * scale, y + 17 * scale);
+    ctx.lineTo(x + 7 * scale, y + 17 * scale);
     ctx.stroke();
   }
 
@@ -1395,21 +1694,49 @@ export class ChatCanvasRenderer {
     return result;
   }
 
-  private layoutMessage(message: ChatMessage, theme: RenderTheme, scale: number, previous?: ChatMessage): BubbleLayout {
+  private layoutMessage(
+    message: ChatMessage,
+    theme: RenderTheme,
+    metrics: RenderMetrics,
+    previous?: ChatMessage,
+    next?: ChatMessage,
+  ): BubbleLayout {
     const ctx = this.ctx;
-    const maxWidth = 760 * scale;
-    const font = `400 ${30 * scale}px system-ui, -apple-system, "Segoe UI Emoji", sans-serif`;
-    const card = messageCardPresentation(message);
+    const { scale, bubbleMaxWidth: maxWidth } = metrics;
+    const sequence = messageSequencePosition(previous, message, next);
+    const direction = messageDirection(message, theme.selfName);
+    const isSystem = direction === "system";
+    const deleted = message.kind === "deleted";
+    const rawCard = messageCardPresentation(message);
+    const card = isSystem || deleted ? undefined : rawCard;
     const firstGroupItem = isFirstAttachmentGroupItem(message);
-    const showTimestamp = shouldShowMessageTimestamp(message);
-    const caption = firstGroupItem ? (card ? card.body ?? "" : cleanMediaCaption(message)) : "";
-    const lines = this.wrapText(caption, maxWidth - 54 * scale, font);
-    const quoteLines = this.wrapText(firstGroupItem ? message.quotedText ?? "" : "", maxWidth - 92 * scale, `400 ${24 * scale}px system-ui, -apple-system, "Segoe UI Emoji", sans-serif`);
-    const label = senderLabel(message, theme, this.participants);
-    ctx.font = font;
-    const textWidth = Math.max(0, ...lines.map((line) => ctx.measureText(line || " ").width));
-    ctx.font = `500 ${23 * scale}px system-ui, -apple-system, sans-serif`;
+    const showTimestamp = shouldShowMessageTimestamp(message) && !isSystem;
+    let caption = "";
+    if (isSystem) {
+      caption = rawCard
+        ? [rawCard.title, rawCard.detail, rawCard.body].filter(Boolean).join(" · ")
+        : message.displayText ?? message.text;
+    } else if (deleted) {
+      caption = rawCard?.title ?? "Nachricht gelöscht";
+    } else if (firstGroupItem) {
+      caption = card ? card.body ?? "" : cleanMediaCaption(message);
+    }
+
+    const bodyFont = `${deleted ? "italic " : ""}400 ${28 * scale}px system-ui, -apple-system, "Segoe UI Emoji", sans-serif`;
+    const systemFont = `500 ${19 * scale}px system-ui, -apple-system, "Segoe UI Emoji", sans-serif`;
+    const lines = this.wrapText(caption, maxWidth - 50 * scale, isSystem ? systemFont : bodyFont);
+    const quoteLines = this.wrapText(
+      firstGroupItem && !isSystem ? message.quotedText ?? "" : "",
+      maxWidth - 76 * scale,
+      `400 ${23 * scale}px system-ui, -apple-system, "Segoe UI Emoji", sans-serif`,
+    );
+    const label = senderLabel(message, theme, this.participants, this.groupChat, sequence);
+    ctx.font = isSystem ? systemFont : bodyFont;
+    const lineWidths = lines.map((line) => ctx.measureText(line || " ").width);
+    const textWidth = Math.max(0, ...lineWidths);
+    ctx.font = `600 ${22 * scale}px system-ui, -apple-system, sans-serif`;
     const senderWidth = label ? ctx.measureText(label).width : 0;
+
     const visualDimensions = message.attachment?.status === "found"
       ? this.media.getMediaDimensions(message.attachment.archivePath)
       : undefined;
@@ -1418,48 +1745,85 @@ export class ChatCanvasRenderer {
     let mediaWidth = 0;
     let mediaHeight = 0;
     if (!hasVisual && hasAttachment) {
-      mediaWidth = 582 * scale;
-      mediaHeight = /\.(?:vcf|vcard)$/iu.test(message.attachment?.displayName ?? "") ? 132 * scale : 92 * scale;
+      mediaWidth = Math.min(582 * scale, maxWidth - 20 * scale);
+      mediaHeight = /\.(?:vcf|vcard)$/iu.test(message.attachment?.displayName ?? "") ? 132 * scale : 96 * scale;
     }
-    const cardWidth = card ? 620 * scale : 0;
+
+    const cardWidth = card ? Math.min(620 * scale, maxWidth - 20 * scale) : 0;
     const cardDetailLines = card
-      ? this.wrapText(card.detail ?? "", cardWidth - 112 * scale, `400 ${22 * scale}px system-ui, -apple-system, "Segoe UI Emoji", sans-serif`)
+      ? this.wrapText(card.detail ?? "", cardWidth - 112 * scale, `400 ${21 * scale}px system-ui, -apple-system, "Segoe UI Emoji", sans-serif`)
       : [];
     const cardItemLines = card
-      ? card.items.map((item) => this.wrapText(item, cardWidth - 80 * scale, `400 ${23 * scale}px system-ui, -apple-system, "Segoe UI Emoji", sans-serif`))
+      ? card.items.map((item) => this.wrapText(item, cardWidth - 80 * scale, `400 ${22 * scale}px system-ui, -apple-system, "Segoe UI Emoji", sans-serif`))
       : [];
-    const cardItemHeights = cardItemLines.map((itemLines) => Math.max(42 * scale, itemLines.length * 28 * scale + 14 * scale));
-    const cardHeaderHeight = card ? Math.max(74 * scale, 56 * scale + cardDetailLines.length * 27 * scale) : 0;
-    const cardHeight = card ? cardHeaderHeight + cardItemHeights.reduce((sum, itemHeight) => sum + itemHeight + 8 * scale, 0) + 16 * scale : 0;
-    const senderHeight = label ? 34 * scale : 0;
-    const forwardedHeight = forwardedPresentationLabel(message) ? 29 * scale : 0;
-    const quoteHeight = quoteLines.length ? quoteLines.length * 31 * scale + 26 * scale : 0;
-    const textHeight = lines.length ? lines.length * 39 * scale + 8 * scale : 0;
-    const cardSpacing = cardHeight ? 12 * scale : 0;
-    const quoteSpacing = quoteHeight ? 10 * scale : 0;
-    const footerHeight = showTimestamp ? 35 * scale : 4 * scale;
+    const cardItemHeights = cardItemLines.map((itemLines) => Math.max(40 * scale, itemLines.length * 27 * scale + 13 * scale));
+    const cardHeaderHeight = card ? Math.max(72 * scale, 54 * scale + cardDetailLines.length * 26 * scale) : 0;
+    const cardHeight = card ? cardHeaderHeight + cardItemHeights.reduce((sum, itemHeight) => sum + itemHeight + 8 * scale, 0) + 14 * scale : 0;
+    const senderHeight = label ? 29 * scale : 0;
+    const forwardedHeight = forwardedPresentationLabel(message) ? 25 * scale : 0;
+    const quoteHeight = quoteLines.length ? quoteLines.length * 29 * scale + 22 * scale : 0;
+    const textHeight = lines.length ? lines.length * (isSystem ? 27 : 36) * scale : 0;
+
+    ctx.font = `400 ${18 * scale}px system-ui, -apple-system, sans-serif`;
+    const timeLabel = `${message.edited ? "bearbeitet · " : ""}${formatTime(message.timestamp)}`;
+    const timeWidth = showTimestamp
+      ? ctx.measureText(timeLabel).width + (direction === "outgoing" ? 29 * scale : 0)
+      : 0;
+
     if (hasVisual && message.attachment) {
       const dimensions = visualDimensions ?? { width: 16, height: 9 };
-      const chatViewportHeight = Math.max(280 * scale, this.canvas.height - 298 * scale);
-      const nonMediaHeight = 28 * scale + senderHeight + forwardedHeight + quoteHeight + quoteSpacing
-        + cardHeight + cardSpacing + textHeight + footerHeight + 12 * scale;
-      const maxVisualHeight = Math.max(120 * scale, Math.min(610 * scale, chatViewportHeight - nonMediaHeight));
-      const roleMaxWidth = message.mediaRole === "sticker" ? 330 * scale : message.mediaRole === "video-note" ? 430 * scale : 690 * scale;
+      const chatViewportHeight = Math.max(260 * scale, this.canvas.height - metrics.headerHeight - metrics.composerHeight);
+      const nonMediaHeight = senderHeight + forwardedHeight + quoteHeight + cardHeight + textHeight + 78 * scale;
+      const maxVisualHeight = Math.max(120 * scale, Math.min(chatViewportHeight * 0.72, chatViewportHeight - nonMediaHeight));
+      const roleMaxWidth = message.mediaRole === "sticker"
+        ? Math.min(330 * scale, maxWidth - 10 * scale)
+        : message.mediaRole === "video-note"
+          ? Math.min(430 * scale, maxWidth - 10 * scale)
+          : maxWidth - 10 * scale;
       const roleMaxHeight = message.mediaRole === "sticker" ? Math.min(maxVisualHeight, 330 * scale) : maxVisualHeight;
       const fitted = fitMediaBox(dimensions.width, dimensions.height, roleMaxWidth, roleMaxHeight);
       mediaWidth = fitted.width;
       mediaHeight = fitted.height;
     }
-    const baseWidth = Math.max(
-      190 * scale,
-      mediaWidth ? mediaWidth + 28 * scale : 0,
-      cardWidth ? cardWidth + 28 * scale : 0,
-      textWidth + 58 * scale,
-      senderWidth + 58 * scale,
+
+    const timestampOverlay = showTimestamp
+      && hasVisual
+      && !card
+      && !lines.length
+      && !quoteLines.length
+      && !label
+      && !forwardedPresentationLabel(message);
+    const lastLineWidth = lineWidths[lineWidths.length - 1] ?? 0;
+    const timestampInline = showTimestamp
+      && lines.length > 0
+      && !hasVisual
+      && !hasAttachment
+      && !card
+      && !quoteLines.length
+      && !label
+      && !forwardedPresentationLabel(message)
+      && lastLineWidth + timeWidth + 22 * scale <= maxWidth - 50 * scale;
+    const topPadding = isSystem ? 11 * scale : hasVisual ? 5 * scale : 14 * scale;
+    const bottomPadding = timestampOverlay || hasVisual ? 5 * scale : 10 * scale;
+    const horizontalPadding = isSystem ? 34 * scale : hasVisual ? 10 * scale : 50 * scale;
+    let baseWidth = Math.max(
+      isSystem ? 140 * scale : 180 * scale,
+      mediaWidth ? mediaWidth + 10 * scale : 0,
+      cardWidth ? cardWidth + 20 * scale : 0,
+      textWidth + horizontalPadding,
+      senderWidth + 50 * scale,
     );
+    if (timestampInline) baseWidth = Math.max(baseWidth, lastLineWidth + timeWidth + 72 * scale);
+    if (showTimestamp && !timestampOverlay && !timestampInline && !mediaHeight && !cardHeight) {
+      baseWidth = Math.max(baseWidth, timeWidth + 50 * scale);
+    }
     const width = Math.min(maxWidth, baseWidth);
-    const mediaSpacing = mediaHeight ? 12 * scale : 0;
-    const height = 28 * scale + senderHeight + forwardedHeight + quoteHeight + quoteSpacing + cardHeight + cardSpacing + mediaHeight + mediaSpacing + textHeight + footerHeight;
+    const quoteSpacing = quoteHeight ? 8 * scale : 0;
+    const cardSpacing = cardHeight && (mediaHeight || textHeight) ? 10 * scale : 0;
+    const mediaSpacing = mediaHeight && textHeight ? 10 * scale : 0;
+    const footerHeight = showTimestamp && !timestampInline && !timestampOverlay ? 25 * scale : 0;
+    const height = topPadding + senderHeight + forwardedHeight + quoteHeight + quoteSpacing
+      + cardHeight + cardSpacing + mediaHeight + mediaSpacing + textHeight + footerHeight + bottomPadding;
     const dateLabel = !previous || dayKey(previous.timestamp) !== dayKey(message.timestamp) ? formatDay(message.timestamp) : undefined;
     return {
       message,
@@ -1477,35 +1841,46 @@ export class ChatCanvasRenderer {
       cardWidth,
       cardHeight,
       dateLabel,
+      sequence,
+      timestampInline,
+      timestampOverlay,
+      topPadding,
+      bottomPadding,
     };
   }
 
-  private drawMessages(timeline: CompiledTimeline, time: number, theme: RenderTheme, palette: Palette, bottom: number, scale: number): void {
+  private drawMessages(timeline: CompiledTimeline, time: number, theme: RenderTheme, palette: Palette, bottom: number, metrics: RenderMetrics): void {
     const visibleCount = visibleEventCount(timeline, time);
     if (!visibleCount) return;
+    const { scale } = metrics;
     const start = Math.max(0, visibleCount - 90);
     const events = timeline.events.slice(start, visibleCount);
     const layouts = events.map((event, index) => this.layoutMessage(
       event.message,
       theme,
-      scale,
+      metrics,
       timeline.events[start + index - 1]?.message,
+      timeline.events[start + index + 1]?.message,
     ));
     const gaps = layouts.map((layout, index) => messageGapAfter(
       layout.message,
       timeline.events[start + index + 1]?.message,
       scale,
     ));
-    const dateHeight = 66 * scale;
-    const total = layouts.reduce((sum, layout, index) => sum + layout.height + (gaps[index] ?? 15 * scale) + (layout.dateLabel ? dateHeight : 0), 0);
+    const progresses = events.map((event) => easeOut((time - event.at) / event.revealDuration));
+    const dateHeight = 54 * scale;
+    const total = layouts.reduce((sum, layout, index) => {
+      const progress = progresses[index] ?? 1;
+      return sum + (layout.height + (gaps[index] ?? 14 * scale) + (layout.dateLabel ? dateHeight : 0)) * progress;
+    }, 0);
     // Anchor the newest message above the composer. When the chat is taller than
     // the viewport, older bubbles deliberately move above the clipping region.
-    let y = bottom - 24 * scale - total;
+    let y = bottom - 18 * scale - total;
     const latestLayout = layouts[layouts.length - 1];
     const latestEvent = events[events.length - 1];
     if (latestLayout && latestEvent) {
       const latestEntryHeight = latestLayout.height + (gaps[gaps.length - 1] ?? 15 * scale) + (latestLayout.dateLabel ? dateHeight : 0);
-      const availableHeight = Math.max(120 * scale, bottom - 132 * scale - 48 * scale);
+      const availableHeight = Math.max(120 * scale, bottom - metrics.headerHeight - 36 * scale);
       const nextEventAt = timeline.events[visibleCount]?.at ?? timeline.duration;
       y += oversizedBubbleScrollOffset(
         latestEntryHeight,
@@ -1514,41 +1889,47 @@ export class ChatCanvasRenderer {
         nextEventAt - latestEvent.at,
       );
     }
-    const w = this.canvas.width;
+    const centerX = metrics.contentX + metrics.contentWidth / 2;
 
     layouts.forEach((layout, index) => {
       const event = events[index];
       if (!event) return;
+      const progress = progresses[index] ?? 1;
       if (layout.dateLabel) {
-        const chipWidth = 245 * scale;
-        roundedRect(this.ctx, (w - chipWidth) / 2, y + 9 * scale, chipWidth, 44 * scale, 16 * scale);
+        this.ctx.font = `500 ${18 * scale}px system-ui, -apple-system, sans-serif`;
+        const chipWidth = this.ctx.measureText(layout.dateLabel).width + 34 * scale;
+        const chipY = y + (1 - progress) * 18 * scale + 6 * scale;
+        this.ctx.save();
+        this.ctx.globalAlpha = progress;
+        roundedRect(this.ctx, centerX - chipWidth / 2, chipY, chipWidth, 36 * scale, 12 * scale);
         this.ctx.fillStyle = palette.system;
         this.ctx.fill();
         this.ctx.fillStyle = palette.mutedText;
-        this.ctx.font = `500 ${19 * scale}px system-ui, -apple-system, sans-serif`;
         this.ctx.textAlign = "center";
         this.ctx.textBaseline = "middle";
-        this.ctx.fillText(layout.dateLabel, w / 2, y + 31 * scale);
-        y += dateHeight;
+        this.ctx.fillText(layout.dateLabel, centerX, chipY + 18 * scale);
+        this.ctx.restore();
+        y += dateHeight * progress;
       }
-      const progress = easeOut((time - event.at) / event.revealDuration);
-      const translatedY = y + (1 - progress) * 28 * scale;
+      const translatedY = y + (1 - progress) * 24 * scale;
       this.ctx.save();
       this.ctx.globalAlpha = progress;
-      this.drawBubble(layout, theme, palette, translatedY, scale);
+      this.drawBubble(layout, theme, palette, translatedY, metrics);
       this.ctx.restore();
-      y += layout.height + (gaps[index] ?? 15 * scale);
+      y += (layout.height + (gaps[index] ?? 14 * scale)) * progress;
     });
   }
 
-  private drawBubble(layout: BubbleLayout, theme: RenderTheme, palette: Palette, y: number, scale: number): void {
+  private drawBubble(layout: BubbleLayout, theme: RenderTheme, palette: Palette, y: number, metrics: RenderMetrics): void {
     const ctx = this.ctx;
-    const w = this.canvas.width;
+    const { scale, contentX, contentWidth, sidePadding } = metrics;
     const direction = messageDirection(layout.message, theme.selfName);
     const isSystem = direction === "system";
     const mine = direction === "outgoing";
-    const width = isSystem ? Math.min(720 * scale, layout.width) : layout.width;
-    const x = isSystem ? (w - width) / 2 : mine ? w - 34 * scale - width : 34 * scale;
+    const width = layout.width;
+    const left = contentX + sidePadding;
+    const right = contentX + contentWidth - sidePadding;
+    const x = isSystem ? contentX + (contentWidth - width) / 2 : mine ? right - width : left;
     const stickerPath = layout.message.attachment?.archivePath;
     const transparentSticker = layout.message.mediaRole === "sticker"
       && layout.message.attachment?.status === "found"
@@ -1560,58 +1941,113 @@ export class ChatCanvasRenderer {
       && !layout.quoteLines.length
       && !forwardedPresentationLabel(layout.message);
     if (!bareSticker) {
-      roundedRect(ctx, x, y, width, layout.height, 20 * scale);
+      const radius = 12 * scale;
+      const joinedTop = ["middle", "last"].includes(layout.sequence);
+      const joinedBottom = ["first", "middle"].includes(layout.sequence);
+      const topLeft = !isSystem && !mine && joinedTop ? 4 * scale : radius;
+      const topRight = !isSystem && mine && joinedTop ? 4 * scale : radius;
+      const bottomRight = !isSystem && mine && joinedBottom ? 4 * scale : radius;
+      const bottomLeft = !isSystem && !mine && joinedBottom ? 4 * scale : radius;
+      roundedRectCorners(ctx, x, y, width, layout.height, topLeft, topRight, bottomRight, bottomLeft);
       ctx.fillStyle = isSystem ? palette.system : mine ? palette.outgoing : palette.incoming;
       ctx.fill();
+      const showTail = !isSystem && ["single", "first"].includes(layout.sequence);
+      if (showTail) {
+        ctx.beginPath();
+        if (mine) {
+          ctx.moveTo(x + width - 3 * scale, y + 2 * scale);
+          ctx.lineTo(x + width + 10 * scale, y + 2 * scale);
+          ctx.lineTo(x + width - 1 * scale, y + 18 * scale);
+        } else {
+          ctx.moveTo(x + 3 * scale, y + 2 * scale);
+          ctx.lineTo(x - 10 * scale, y + 2 * scale);
+          ctx.lineTo(x + 1 * scale, y + 18 * scale);
+        }
+        ctx.closePath();
+        ctx.fill();
+      }
     }
-    let cursorY = y + 23 * scale;
+    let cursorY = y + layout.topPadding;
     if (layout.senderLabel) {
-      ctx.fillStyle = palette.accent;
-      ctx.font = `500 ${23 * scale}px system-ui, -apple-system, sans-serif`;
+      ctx.fillStyle = senderColor(layout.message.sender ?? "", this.participants, palette);
+      ctx.font = `600 ${22 * scale}px system-ui, -apple-system, sans-serif`;
       ctx.textAlign = "left";
       ctx.textBaseline = "top";
-      ctx.fillText(layout.senderLabel, x + 27 * scale, cursorY);
-      cursorY += 34 * scale;
+      ctx.fillText(layout.senderLabel, x + 25 * scale, cursorY);
+      cursorY += 29 * scale;
     }
     const forwardedLabel = forwardedPresentationLabel(layout.message);
     if (forwardedLabel) {
       ctx.fillStyle = palette.mutedText;
-      ctx.font = `500 ${20 * scale}px system-ui, -apple-system, sans-serif`;
+      ctx.font = `italic 400 ${19 * scale}px system-ui, -apple-system, sans-serif`;
       ctx.textAlign = "left";
       ctx.textBaseline = "top";
-      ctx.fillText(forwardedLabel, x + 27 * scale, cursorY);
-      cursorY += 29 * scale;
+      ctx.fillText(forwardedLabel, x + 25 * scale, cursorY);
+      cursorY += 25 * scale;
     }
     if (layout.quoteLines.length) {
-      const quoteHeight = layout.quoteLines.length * 31 * scale + 26 * scale;
-      this.drawQuoteBlock(layout.quoteLines, x + 18 * scale, cursorY, width - 36 * scale, quoteHeight, palette, scale);
-      cursorY += quoteHeight + 10 * scale;
+      const quoteHeight = layout.quoteLines.length * 29 * scale + 22 * scale;
+      this.drawQuoteBlock(layout.quoteLines, x + 15 * scale, cursorY, width - 30 * scale, quoteHeight, palette, scale);
+      cursorY += quoteHeight + 8 * scale;
     }
     if (layout.card && layout.cardHeight > 0) {
       const cardX = x + (width - layout.cardWidth) / 2;
       this.drawSpecialCard(layout, cardX, cursorY, layout.cardWidth, layout.cardHeight, palette, scale);
-      cursorY += layout.cardHeight + 12 * scale;
+      cursorY += layout.cardHeight + (layout.mediaHeight || layout.lines.length ? 10 * scale : 0);
     }
     if (layout.mediaHeight > 0) {
       const mediaX = x + (width - layout.mediaWidth) / 2;
       this.drawMedia(layout, mediaX, cursorY, layout.mediaWidth, layout.mediaHeight, palette, scale);
-      cursorY += layout.mediaHeight + 12 * scale;
+      cursorY += layout.mediaHeight + (layout.lines.length ? 10 * scale : 0);
     }
-    if (layout.lines.length) this.drawTextLines(layout.lines, x + 27 * scale, cursorY, width - 54 * scale, palette, scale, isSystem && !layout.card);
+    if (layout.lines.length) {
+      this.drawTextLines(
+        layout.lines,
+        x + (isSystem ? 17 : 25) * scale,
+        cursorY,
+        width - (isSystem ? 34 : 50) * scale,
+        palette,
+        scale,
+        isSystem,
+        layout.message.kind === "deleted" ? "deleted" : isSystem ? "system" : "normal",
+      );
+    }
     if (isSystem || !shouldShowMessageTimestamp(layout.message)) return;
-    const timeLabel = `${layout.message.edited ? "BEARBEITET · " : ""}${formatTime(layout.message.timestamp)}`;
-    if (bareSticker) {
-      ctx.font = `500 ${19 * scale}px system-ui, -apple-system, sans-serif`;
-      const chipWidth = ctx.measureText(timeLabel).width + 20 * scale;
-      roundedRect(ctx, x + width - chipWidth - 10 * scale, y + layout.height - 37 * scale, chipWidth, 28 * scale, 9 * scale);
+    const timeLabel = `${layout.message.edited ? "bearbeitet · " : ""}${formatTime(layout.message.timestamp)}`;
+    ctx.font = `400 ${18 * scale}px system-ui, -apple-system, sans-serif`;
+    const checkWidth = mine ? 25 * scale : 0;
+    if (layout.timestampOverlay || bareSticker) {
+      const chipWidth = ctx.measureText(timeLabel).width + checkWidth + 18 * scale;
+      roundedRect(ctx, x + width - chipWidth - 8 * scale, y + layout.height - 31 * scale, chipWidth, 25 * scale, 8 * scale);
       ctx.fillStyle = "rgba(0, 0, 0, .55)";
       ctx.fill();
     }
-    ctx.fillStyle = bareSticker ? "#ffffff" : palette.mutedText;
-    ctx.font = `400 ${19 * scale}px system-ui, -apple-system, sans-serif`;
+    const timeRight = x + width - (mine ? 34 : 15) * scale;
+    ctx.fillStyle = layout.timestampOverlay || bareSticker ? "#ffffff" : mine ? palette.outgoingMuted : palette.mutedText;
     ctx.textAlign = "right";
     ctx.textBaseline = "bottom";
-    ctx.fillText(timeLabel, x + width - 20 * scale, y + layout.height - 12 * scale);
+    ctx.fillText(timeLabel, timeRight, y + layout.height - layout.bottomPadding);
+    if (mine) {
+      this.drawSentCheck(
+        x + width - 22 * scale,
+        y + layout.height - layout.bottomPadding - 7 * scale,
+        layout.timestampOverlay || bareSticker ? "#ffffff" : palette.outgoingMuted,
+        scale,
+      );
+    }
+  }
+
+  private drawSentCheck(x: number, y: number, color: string, scale: number): void {
+    const ctx = this.ctx;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = Math.max(1.2, 2 * scale);
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.beginPath();
+    ctx.moveTo(x - 6 * scale, y);
+    ctx.lineTo(x - 1 * scale, y + 5 * scale);
+    ctx.lineTo(x + 8 * scale, y - 6 * scale);
+    ctx.stroke();
   }
 
   private drawQuoteBlock(
@@ -1629,14 +2065,11 @@ export class ChatCanvasRenderer {
     ctx.fill();
     ctx.fillStyle = palette.accent;
     ctx.fillRect(x, y, 6 * scale, height);
-    ctx.fillStyle = palette.mutedText;
-    ctx.font = `500 ${18 * scale}px system-ui, -apple-system, sans-serif`;
+    ctx.fillStyle = palette.text;
+    ctx.font = `400 ${23 * scale}px system-ui, -apple-system, "Segoe UI Emoji", sans-serif`;
     ctx.textAlign = "left";
     ctx.textBaseline = "top";
-    ctx.fillText("ZITAT", x + 20 * scale, y + 9 * scale);
-    ctx.fillStyle = palette.text;
-    ctx.font = `400 ${24 * scale}px system-ui, -apple-system, "Segoe UI Emoji", sans-serif`;
-    lines.forEach((line, index) => ctx.fillText(line, x + 20 * scale, y + 34 * scale + index * 31 * scale));
+    lines.forEach((line, index) => ctx.fillText(line, x + 19 * scale, y + 11 * scale + index * 29 * scale));
   }
 
   private drawSpecialCard(
@@ -1692,14 +2125,26 @@ export class ChatCanvasRenderer {
     });
   }
 
-  private drawTextLines(lines: string[], x: number, y: number, _width: number, palette: Palette, scale: number, centered: boolean): void {
+  private drawTextLines(
+    lines: string[],
+    x: number,
+    y: number,
+    width: number,
+    palette: Palette,
+    scale: number,
+    centered: boolean,
+    variant: "normal" | "system" | "deleted" = "normal",
+  ): void {
     const ctx = this.ctx;
-    ctx.fillStyle = palette.text;
-    ctx.font = `400 ${30 * scale}px system-ui, -apple-system, "Segoe UI Emoji", sans-serif`;
+    ctx.fillStyle = variant === "normal" ? palette.text : palette.mutedText;
+    ctx.font = variant === "system"
+      ? `500 ${19 * scale}px system-ui, -apple-system, "Segoe UI Emoji", sans-serif`
+      : `${variant === "deleted" ? "italic " : ""}400 ${28 * scale}px system-ui, -apple-system, "Segoe UI Emoji", sans-serif`;
     ctx.textAlign = centered ? "center" : "left";
     ctx.textBaseline = "top";
-    const drawX = centered ? this.canvas.width / 2 : x;
-    lines.forEach((line, index) => ctx.fillText(line, drawX, y + index * 39 * scale));
+    const drawX = centered ? x + width / 2 : x;
+    const lineHeight = (variant === "system" ? 27 : 36) * scale;
+    lines.forEach((line, index) => ctx.fillText(line, drawX, y + index * lineHeight));
   }
 
   private drawMedia(layout: BubbleLayout, x: number, y: number, width: number, height: number, palette: Palette, scale: number): void {
@@ -1875,36 +2320,40 @@ export class ChatCanvasRenderer {
     const elapsed = clamp(this.currentTime - eventAt, 0, clip.duration);
     const progress = clip.duration > 0 ? elapsed / clip.duration : 0;
     const active = this.currentTime >= eventAt && this.currentTime < eventAt + clip.duration;
-    const buttonX = x + 45 * scale;
-    const middleY = y + height / 2;
+    const buttonX = x + 42 * scale;
+    const middleY = y + 43 * scale;
     ctx.fillStyle = palette.accent;
     ctx.beginPath();
-    ctx.arc(buttonX, middleY, 29 * scale, 0, Math.PI * 2);
+    ctx.arc(buttonX, middleY, 27 * scale, 0, Math.PI * 2);
     ctx.fill();
     ctx.fillStyle = "#ffffff";
-    ctx.font = `600 ${21 * scale}px system-ui, sans-serif`;
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    ctx.fillText(active ? "Ⅱ" : "▶", buttonX + (active ? 0 : 2 * scale), middleY);
+    ctx.beginPath();
+    if (active) {
+      ctx.fillRect(buttonX - 7 * scale, middleY - 9 * scale, 5 * scale, 18 * scale);
+      ctx.fillRect(buttonX + 3 * scale, middleY - 9 * scale, 5 * scale, 18 * scale);
+    } else {
+      ctx.moveTo(buttonX - 6 * scale, middleY - 11 * scale);
+      ctx.lineTo(buttonX + 11 * scale, middleY);
+      ctx.lineTo(buttonX - 6 * scale, middleY + 11 * scale);
+      ctx.closePath();
+      ctx.fill();
+    }
 
-    const waveformX = x + 88 * scale;
-    const waveformWidth = Math.max(80 * scale, width - 184 * scale);
+    const waveformX = x + 80 * scale;
+    const waveformWidth = Math.max(80 * scale, width - 102 * scale);
     const barStep = waveformWidth / clip.peaks.length;
     clip.peaks.forEach((peak, index) => {
       const barProgress = (index + 0.5) / clip.peaks.length;
-      const barHeight = Math.max(5 * scale, peak * 45 * scale);
+      const barHeight = Math.max(4 * scale, peak * 34 * scale);
       ctx.fillStyle = barProgress <= progress ? palette.accent : palette.mutedText;
       ctx.fillRect(waveformX + index * barStep, middleY - barHeight / 2, Math.max(2 * scale, barStep * 0.42), barHeight);
     });
 
     ctx.fillStyle = palette.mutedText;
-    ctx.font = `600 ${14 * scale}px system-ui, sans-serif`;
+    ctx.font = `400 ${17 * scale}px system-ui, sans-serif`;
     ctx.textAlign = "left";
-    ctx.textBaseline = "top";
-    ctx.fillText(layout.message.mediaRole === "voice-note" ? "SPRACHNACHRICHT" : "AUDIO", waveformX, y + 7 * scale);
-    ctx.font = `500 ${18 * scale}px system-ui, sans-serif`;
-    ctx.textAlign = "right";
-    ctx.textBaseline = "middle";
-    ctx.fillText(`${Math.floor(elapsed / 60)}:${String(Math.floor(elapsed % 60)).padStart(2, "0")}`, x + width - 18 * scale, middleY);
+    ctx.textBaseline = "bottom";
+    const shownSeconds = active ? elapsed : clip.duration;
+    ctx.fillText(`${Math.floor(shownSeconds / 60)}:${String(Math.floor(shownSeconds % 60)).padStart(2, "0")}`, waveformX, y + height - 8 * scale);
   }
 }

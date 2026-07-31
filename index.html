@@ -13,10 +13,10 @@
           <span class="brand-mark" aria-hidden="true">▶</span>
           <div>
             <h1>WhatsApp Replay Studio</h1>
-            <p>Vom Chat-Export zum animierten Replay-Video</p>
+            <p>Aus deinem Chat-Export wird ein authentisches Replay-Video</p>
           </div>
         </div>
-        <div class="privacy-pill"><span aria-hidden="true">●</span> Bleibt auf deinem Gerät</div>
+        <div class="privacy-pill"><span aria-hidden="true">●</span> Verarbeitung nur auf deinem Gerät</div>
       </header>
 
       <main class="workspace">
@@ -24,16 +24,16 @@
           <section class="panel import-panel">
             <div class="section-heading">
               <span class="step">1</span>
-              <div><h2>Chat importieren</h2><p>WhatsApp-ZIP oder Chat-TXT</p></div>
+              <div><h2>Chat-Export importieren</h2><p>ZIP-Datei mit Medien oder einzelne TXT-Datei</p></div>
             </div>
             <input id="file-input" class="visually-hidden" type="file" accept=".zip,.txt,application/zip,text/plain" />
             <label id="drop-zone" class="drop-zone" for="file-input">
               <span class="upload-icon" aria-hidden="true">⇧</span>
-              <strong>ZIP hier ablegen</strong>
-              <span>oder Datei auswählen</span>
-              <small>Export mit oder ohne Medien</small>
+              <strong>ZIP oder TXT hier ablegen</strong>
+              <span>oder zum Auswählen antippen</span>
+              <small>ZIP-Exporte können Bilder, Videos und Audiodateien enthalten.</small>
             </label>
-            <button id="demo-button" class="text-button" type="button">Beispiel-Chat laden</button>
+            <button id="demo-button" class="text-button" type="button">Demo-Chat ausprobieren</button>
             <div id="import-status" class="status-line" role="status" aria-live="polite"></div>
           </section>
 
@@ -62,7 +62,7 @@
 
             <section class="panel">
               <div class="section-heading compact">
-                <span class="step">2</span><div><h2>Replay einrichten</h2><p>Person, Zeitraum und Timing</p></div>
+                <span class="step">2</span><div><h2>Replay einrichten</h2><p>Absender, Zeitraum und Tempo</p></div>
               </div>
               <div class="field-grid">
                 <label class="field">
@@ -72,14 +72,14 @@
                 </label>
                 <label class="field"><span>Chat-Titel</span><input id="chat-title" type="text" maxlength="48" /></label>
               </div>
-              <div class="range-group">
-                <div class="range-label"><span>Start</span><strong id="start-label"></strong></div>
-                <input id="start-range" type="range" min="0" max="0" value="0" />
-                <div class="range-label"><span>Ende</span><strong id="end-label"></strong></div>
-                <input id="end-range" type="range" min="0" max="0" value="0" />
+              <div class="range-group" role="group" aria-label="Zeitraum des Replays">
+                <label class="range-label" for="start-range"><span>Erste Nachricht</span><strong id="start-label"></strong></label>
+                <input id="start-range" type="range" min="0" max="0" value="0" aria-describedby="start-label" />
+                <label class="range-label" for="end-range"><span>Letzte Nachricht</span><strong id="end-label"></strong></label>
+                <input id="end-range" type="range" min="0" max="0" value="0" aria-describedby="end-label" />
               </div>
               <div class="field-grid">
-                <label class="field"><span>Timing</span>
+                <label class="field"><span>Zeitsteuerung</span>
                   <select id="timing-mode">
                     <option value="adaptive">Adaptiv</option>
                     <option value="fixed">Fester Takt</option>
@@ -95,7 +95,7 @@
                 </label>
               </div>
               <div id="factor-field" class="field" hidden>
-                <span>1 Videosekunde entspricht</span>
+                <label for="speed-factor">1 Videosekunde entspricht</label>
                 <select id="speed-factor">
                   <option value="60">1 Minute Chat</option>
                   <option value="300">5 Minuten Chat</option>
@@ -108,7 +108,7 @@
 
             <section class="panel">
               <div class="section-heading compact">
-                <span class="step">3</span><div><h2>Look & Export</h2><p>Format und Darstellung</p></div>
+                <span class="step">3</span><div><h2>Design &amp; Export</h2><p>Videoformat und Chat-Darstellung</p></div>
               </div>
               <div class="field-grid">
                 <label class="field"><span>Videoformat</span>
@@ -119,8 +119,8 @@
                     <option value="landscape-1080">16:9 · 1080p</option>
                   </select>
                 </label>
-                <label class="field"><span>Chat-Theme</span>
-                  <select id="theme"><option value="dark">Dunkel</option><option value="light">Hell</option></select>
+                <label class="field"><span>Darstellung</span>
+                  <select id="theme"><option value="dark">Dunkler Chat</option><option value="light">Heller Chat</option></select>
                 </label>
               </div>
               <label class="check-field"><input id="anonymize" type="checkbox" /><span>Namen im Video anonymisieren</span></label>
@@ -135,7 +135,7 @@
 
         <section class="preview-area" aria-label="Video-Vorschau">
           <div class="preview-heading">
-            <div><span class="eyebrow">LIVE-VORSCHAU</span><h2>Dein Chat-Replay</h2></div>
+            <div><span class="eyebrow">LIVE-VORSCHAU</span><h2>So sieht dein Video aus</h2></div>
             <span id="preview-resolution" class="resolution-badge">720 × 1280</span>
           </div>
           <div class="canvas-stage">
@@ -143,15 +143,18 @@
             <div id="empty-preview" class="empty-preview">
               <span aria-hidden="true">↥</span>
               <strong>Noch kein Chat geladen</strong>
-              <small>Importiere eine ZIP, um die Vorschau zu starten.</small>
+              <small>Importiere eine ZIP- oder TXT-Datei, um die Vorschau zu starten.</small>
             </div>
             <div id="render-overlay" class="render-overlay" hidden>
-              <div class="spinner" aria-hidden="true"></div>
-              <strong id="render-title">Video wird erstellt</strong>
-              <span id="render-detail">Vorbereitung …</span>
-              <progress id="render-progress" max="100" value="0"></progress>
-              <span id="render-percent">0 %</span>
-              <button id="cancel-export" class="secondary-button" type="button">Abbrechen</button>
+              <div class="render-status" role="status" aria-live="polite" aria-atomic="false" aria-busy="true" aria-labelledby="render-title" aria-describedby="render-detail render-percent">
+                <div class="spinner" aria-hidden="true"></div>
+                <strong id="render-title">Video wird erstellt</strong>
+                <span id="render-detail">Vorbereitung …</span>
+                <label class="visually-hidden" for="render-progress">Fortschritt der Videoerstellung</label>
+                <progress id="render-progress" max="100" value="0"></progress>
+                <span id="render-percent">0 %</span>
+              </div>
+              <button id="cancel-export" class="secondary-button" type="button">Videoerstellung abbrechen</button>
             </div>
           </div>
           <div class="player-controls">
@@ -165,6 +168,7 @@
             <a id="download-link" class="primary-button" download>Video herunterladen</a>
           </div>
           <p class="local-note"><span aria-hidden="true">◆</span> Der Import und das Rendering passieren vollständig in diesem Browser.</p>
+          <p class="disclaimer">Inoffizielles Tool – nicht mit WhatsApp oder Meta verbunden.</p>
         </section>
       </main>
     </div>
