@@ -110,7 +110,6 @@ export interface RenderMetrics {
   contentX: number;
   contentWidth: number;
   headerHeight: number;
-  composerHeight: number;
   bubbleMaxWidth: number;
   sidePadding: number;
 }
@@ -154,7 +153,6 @@ export function computeRenderMetrics(width: number, height: number): RenderMetri
     contentX: (width - contentWidth) / 2,
     contentWidth,
     headerHeight: 114 * scale * chromeFactor,
-    composerHeight: 106 * scale * chromeFactor,
     bubbleMaxWidth: Math.min(760 * scale, contentWidth * 0.76),
     sidePadding: 28 * scale,
   };
@@ -1785,13 +1783,12 @@ export class ChatCanvasRenderer {
     this.drawPattern(palette, metrics.scale);
 
     this.drawHeader(theme, palette, metrics);
-    this.drawInputBar(palette, h - metrics.composerHeight, metrics);
 
     ctx.save();
     ctx.beginPath();
-    ctx.rect(0, metrics.headerHeight, w, h - metrics.headerHeight - metrics.composerHeight);
+    ctx.rect(0, metrics.headerHeight, w, h - metrics.headerHeight);
     ctx.clip();
-    this.drawMessages(timeline, time, theme, palette, h - metrics.composerHeight, metrics);
+    this.drawMessages(timeline, time, theme, palette, h, metrics);
     ctx.restore();
     ctx.restore();
   }
@@ -1902,15 +1899,13 @@ export class ChatCanvasRenderer {
     const ctx = this.ctx;
     const w = this.canvas.width;
     const { contentX, contentWidth, headerHeight: height, scale } = metrics;
-    const right = contentX + contentWidth;
     ctx.fillStyle = palette.header;
     ctx.fillRect(0, 0, w, height);
     ctx.fillStyle = palette.headerDivider;
     ctx.fillRect(0, height - Math.max(1, scale), w, Math.max(1, scale));
 
-    const avatarX = contentX + 79 * scale;
+    const avatarX = contentX + 61 * scale;
     const avatarY = height / 2;
-    this.drawBackIcon(contentX + 28 * scale, avatarY, palette.headerMuted, scale);
     ctx.fillStyle = palette.accent;
     ctx.beginPath();
     ctx.arc(avatarX, avatarY, 35 * scale, 0, Math.PI * 2);
@@ -1921,11 +1916,8 @@ export class ChatCanvasRenderer {
     ctx.textBaseline = "middle";
     ctx.fillText(initials(theme.title), avatarX, avatarY + 1 * scale);
 
-    const videoX = right - 136 * scale;
-    const phoneX = right - 86 * scale;
-    const menuX = right - 35 * scale;
-    const titleX = contentX + 128 * scale;
-    const titleMaxWidth = Math.max(80 * scale, videoX - titleX - 24 * scale);
+    const titleX = contentX + 112 * scale;
+    const titleMaxWidth = Math.max(80 * scale, contentX + contentWidth - titleX - 28 * scale);
     const subtitle = this.groupChat
       ? this.participants
         .filter((participant) => theme.selfName !== participant)
@@ -1943,157 +1935,6 @@ export class ChatCanvasRenderer {
       ctx.font = `400 ${18 * scale}px system-ui, -apple-system, sans-serif`;
       ctx.fillText(ellipsizeText(ctx, subtitle, titleMaxWidth), titleX, height * 0.7);
     }
-    this.drawVideoCallIcon(videoX, avatarY, palette.headerMuted, scale);
-    this.drawPhoneIcon(phoneX, avatarY, palette.headerMuted, scale);
-    this.drawMenuIcon(menuX, avatarY, palette.headerMuted, scale);
-  }
-
-  private drawInputBar(palette: Palette, y: number, metrics: RenderMetrics): void {
-    const ctx = this.ctx;
-    const w = this.canvas.width;
-    const { contentX, contentWidth, composerHeight: height, scale } = metrics;
-    const right = contentX + contentWidth;
-    const centerY = y + height / 2;
-    ctx.fillStyle = palette.header;
-    ctx.fillRect(0, y, w, height);
-    const plusX = contentX + 31 * scale;
-    const micX = right - 32 * scale;
-    const inputX = contentX + 62 * scale;
-    const inputRight = micX - 47 * scale;
-    roundedRect(ctx, inputX, centerY - 33 * scale, inputRight - inputX, 66 * scale, 33 * scale);
-    ctx.fillStyle = palette.input;
-    ctx.fill();
-    ctx.fillStyle = palette.headerMuted;
-    ctx.font = `400 ${24 * scale}px system-ui, -apple-system, sans-serif`;
-    ctx.textAlign = "left";
-    ctx.textBaseline = "middle";
-    ctx.fillText("Nachricht", inputX + 55 * scale, centerY + 1 * scale);
-    this.drawPlusIcon(plusX, centerY, palette.headerMuted, scale);
-    this.drawSmileIcon(inputX + 27 * scale, centerY, palette.headerMuted, scale);
-    this.drawAttachmentIcon(inputRight - 65 * scale, centerY, palette.headerMuted, scale);
-    this.drawCameraIcon(inputRight - 27 * scale, centerY, palette.headerMuted, scale);
-    ctx.fillStyle = palette.accent;
-    ctx.beginPath();
-    ctx.arc(micX, centerY, 31 * scale, 0, Math.PI * 2);
-    ctx.fill();
-    this.drawMicrophoneIcon(micX, centerY, "#ffffff", scale);
-  }
-
-  private prepareIcon(color: string, scale: number): void {
-    this.ctx.strokeStyle = color;
-    this.ctx.fillStyle = color;
-    this.ctx.lineWidth = Math.max(1.5, 2.8 * scale);
-    this.ctx.lineCap = "round";
-    this.ctx.lineJoin = "round";
-  }
-
-  private drawBackIcon(x: number, y: number, color: string, scale: number): void {
-    const ctx = this.ctx;
-    this.prepareIcon(color, scale);
-    ctx.beginPath();
-    ctx.moveTo(x + 8 * scale, y - 15 * scale);
-    ctx.lineTo(x - 7 * scale, y);
-    ctx.lineTo(x + 8 * scale, y + 15 * scale);
-    ctx.moveTo(x - 6 * scale, y);
-    ctx.lineTo(x + 18 * scale, y);
-    ctx.stroke();
-  }
-
-  private drawVideoCallIcon(x: number, y: number, color: string, scale: number): void {
-    const ctx = this.ctx;
-    this.prepareIcon(color, scale);
-    roundedRect(ctx, x - 16 * scale, y - 11 * scale, 24 * scale, 22 * scale, 4 * scale);
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.moveTo(x + 8 * scale, y - 6 * scale);
-    ctx.lineTo(x + 19 * scale, y - 12 * scale);
-    ctx.lineTo(x + 19 * scale, y + 12 * scale);
-    ctx.lineTo(x + 8 * scale, y + 6 * scale);
-    ctx.closePath();
-    ctx.stroke();
-  }
-
-  private drawPhoneIcon(x: number, y: number, color: string, scale: number): void {
-    const ctx = this.ctx;
-    this.prepareIcon(color, scale);
-    ctx.beginPath();
-    ctx.arc(x, y, 17 * scale, 0.45, 2.68);
-    ctx.moveTo(x + 15 * scale, y + 7 * scale);
-    ctx.lineTo(x + 20 * scale, y + 15 * scale);
-    ctx.lineTo(x + 12 * scale, y + 19 * scale);
-    ctx.moveTo(x - 15 * scale, y - 7 * scale);
-    ctx.lineTo(x - 20 * scale, y - 15 * scale);
-    ctx.lineTo(x - 12 * scale, y - 19 * scale);
-    ctx.stroke();
-  }
-
-  private drawMenuIcon(x: number, y: number, color: string, scale: number): void {
-    const ctx = this.ctx;
-    this.prepareIcon(color, scale);
-    for (const offset of [-10, 0, 10]) {
-      ctx.beginPath();
-      ctx.arc(x, y + offset * scale, 2.1 * scale, 0, Math.PI * 2);
-      ctx.fill();
-    }
-  }
-
-  private drawPlusIcon(x: number, y: number, color: string, scale: number): void {
-    const ctx = this.ctx;
-    this.prepareIcon(color, scale);
-    ctx.beginPath();
-    ctx.arc(x, y, 19 * scale, 0, Math.PI * 2);
-    ctx.moveTo(x - 8 * scale, y);
-    ctx.lineTo(x + 8 * scale, y);
-    ctx.moveTo(x, y - 8 * scale);
-    ctx.lineTo(x, y + 8 * scale);
-    ctx.stroke();
-  }
-
-  private drawSmileIcon(x: number, y: number, color: string, scale: number): void {
-    const ctx = this.ctx;
-    this.prepareIcon(color, scale);
-    ctx.beginPath();
-    ctx.arc(x, y, 15 * scale, 0, Math.PI * 2);
-    ctx.moveTo(x - 6 * scale, y - 4 * scale);
-    ctx.arc(x - 6 * scale, y - 4 * scale, 1.2 * scale, 0, Math.PI * 2);
-    ctx.moveTo(x + 6 * scale, y - 4 * scale);
-    ctx.arc(x + 6 * scale, y - 4 * scale, 1.2 * scale, 0, Math.PI * 2);
-    ctx.moveTo(x - 7 * scale, y + 3 * scale);
-    ctx.arc(x, y + 2 * scale, 8 * scale, 0.18, Math.PI - 0.18);
-    ctx.stroke();
-  }
-
-  private drawAttachmentIcon(x: number, y: number, color: string, scale: number): void {
-    const ctx = this.ctx;
-    this.prepareIcon(color, scale);
-    ctx.beginPath();
-    ctx.arc(x, y, 13 * scale, 0.7, 5.3);
-    ctx.arc(x, y, 8 * scale, 5.3, 0.7, true);
-    ctx.stroke();
-  }
-
-  private drawCameraIcon(x: number, y: number, color: string, scale: number): void {
-    const ctx = this.ctx;
-    this.prepareIcon(color, scale);
-    roundedRect(ctx, x - 15 * scale, y - 11 * scale, 30 * scale, 22 * scale, 5 * scale);
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.arc(x, y, 6 * scale, 0, Math.PI * 2);
-    ctx.stroke();
-  }
-
-  private drawMicrophoneIcon(x: number, y: number, color: string, scale: number): void {
-    const ctx = this.ctx;
-    this.prepareIcon(color, scale);
-    roundedRect(ctx, x - 6 * scale, y - 14 * scale, 12 * scale, 22 * scale, 6 * scale);
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.arc(x, y, 5 * scale, 0, Math.PI);
-    ctx.moveTo(x, y + 10 * scale);
-    ctx.lineTo(x, y + 17 * scale);
-    ctx.moveTo(x - 7 * scale, y + 17 * scale);
-    ctx.lineTo(x + 7 * scale, y + 17 * scale);
-    ctx.stroke();
   }
 
   private wrapText(text: string, maxWidth: number, font: string): string[] {
@@ -2210,7 +2051,7 @@ export class ChatCanvasRenderer {
 
     if (hasVisual && message.attachment) {
       const dimensions = visualDimensions ?? { width: 16, height: 9 };
-      const chatViewportHeight = Math.max(260 * scale, this.canvas.height - metrics.headerHeight - metrics.composerHeight);
+      const chatViewportHeight = Math.max(260 * scale, this.canvas.height - metrics.headerHeight);
       const nonMediaHeight = senderHeight + forwardedHeight + quoteHeight + cardHeight + textHeight + 78 * scale;
       const maxVisualHeight = Math.max(120 * scale, Math.min(chatViewportHeight * 0.72, chatViewportHeight - nonMediaHeight));
       const roleMaxWidth = message.mediaRole === "sticker"
@@ -2311,7 +2152,7 @@ export class ChatCanvasRenderer {
       const progress = progresses[index] ?? 1;
       return sum + (layout.height + (gaps[index] ?? 14 * scale) + (layout.dateLabel ? dateHeight : 0)) * progress;
     }, 0);
-    // Anchor the newest message above the composer. When the chat is taller than
+    // Anchor the newest message above the lower canvas edge. When the chat is taller than
     // the viewport, older bubbles deliberately move above the clipping region.
     let y = bottom - 18 * scale - total;
     const latestLayout = layouts[layouts.length - 1];
